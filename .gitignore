@@ -1,0 +1,29 @@
+# Build outputs
+/build/
+**/build/
+
+# Gradle
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local properties (SDK path, signing keys)
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Native build
+.cxx/
+.externalNativeBuild/
+
+# Kotlin
+.kotlin/
+
+# Virtual environment (model conversion)
+/tmp/
+__pycache__/
+*.pyc
