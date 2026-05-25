@@ -23,20 +23,30 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     /** Pointer to the native Session struct. 0 means closed. Mutated under [opLock]. */
     private var handle: Long = nativeCreate(capacity)
 
-    /** Push one camera frame into the ring buffer. */
+    /**
+     * Push one camera frame into the ring buffer.
+     *
+     * @param rotation9 optional 9-element row-major device rotation matrix
+     *                  (from GyroIntegrator) captured at frame time. When
+     *                  provided, the native aligner can use it as a
+     *                  feature-free fallback on texture-poor scenes.
+     */
     fun pushFrame(
         rgba: ByteArray,
         width: Int,
         height: Int,
         personMasks: Array<ByteArray>,
-        timestampMs: Long
+        timestampMs: Long,
+        rotation9: FloatArray? = null
     ) {
         // tryLock: if a capture is in progress (stitch can take 1–3s), drop this
         // frame rather than block the analyzer pipeline behind it. The buffer
         // shouldn't grow during capture anyway — we're stitching from history.
         if (!opLock.tryLock()) return
         try {
-            if (handle != 0L) nativePushFrame(handle, rgba, width, height, personMasks, timestampMs)
+            if (handle != 0L) nativePushFrame(
+                handle, rgba, width, height, personMasks, timestampMs, rotation9
+            )
         } finally {
             opLock.unlock()
         }
@@ -90,7 +100,14 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         val fullHoleMask: ByteArray,
         val width: Int,
         val height: Int,
-        val fillRatio: Float
+        val fillRatio: Float,
+        // Fraction of hole pixels with ZERO clean-bg samples in the buffer.
+        // Distinct from (1 - fillRatio): that also counts pixels with 1-2
+        // marginal samples (which inpaint can still leverage). A high
+        // noSampleRatio means subject occluded those pixels for the entire
+        // buffer window — the UI should prompt "ask subject to step aside
+        // briefly" because no amount of waiting will recover them.
+        val noSampleRatio: Float
     )
 
     /**
@@ -116,8 +133,13 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         val fullHole    = outArr[3] as? ByteArray ?: return@withLock null
         val dims        = outArr[4] as? IntArray ?: return@withLock null
         val ratio       = outArr[5] as? FloatArray ?: return@withLock null
-        if (dims.size < 2 || ratio.isEmpty()) return@withLock null
-        StitchOutput(rgb, originalRgb, unfilled, fullHole, dims[0], dims[1], ratio[0])
+        if (dims.size < 2 || ratio.size < 2) return@withLock null
+        StitchOutput(
+            rgb, originalRgb, unfilled, fullHole,
+            dims[0], dims[1],
+            fillRatio = ratio[0],
+            noSampleRatio = ratio[1]
+        )
     }
 
     // opencvInpaint / finalize / encodeJpeg deliberately stay outside opLock:
@@ -198,7 +220,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             width: Int,
             height: Int,
             personMasks: Array<ByteArray>,
-            timestampMs: Long
+            timestampMs: Long,
+            rotation9: FloatArray?
         )
         @JvmStatic private external fun nativeTestAlignment(handle: Long): Int
         @JvmStatic private external fun nativeTestStitch(handle: Long): ByteArray?

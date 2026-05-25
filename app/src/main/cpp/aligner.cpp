@@ -12,17 +12,8 @@
 namespace {
 
 constexpr int   kOrbFeatures     = 1000;
-// Lowered from 12 → 8. Scenes with mostly featureless walls/ceiling (selfie
-// indoors, close subjects) struggle to hit 12 ORB inliers even when the
-// alignment is genuinely correct. The homography determinant sanity check
-// below (|det| ∈ [0.25, 4.0]) still rejects the truly degenerate fits.
-constexpr int   kMinGoodMatches  = 4;      // lowered: imperfect alignment > no alignment
-constexpr float kRansacReproj    = 5.0f;   // pixels — permissive RANSAC
-// Safety margin around historical persons. Symmetric with the removal-mask
-// dilation in jni_bridge.cpp (Size(61,61) ≈ 30 px radius). If we trust 30 px
-// of slop around the *target* silhouette, we must trust the same around past
-// silhouettes when deciding "is this pixel clean background" — otherwise a
-// past-person halo leaks into the median and the stitched region carries
+constexpr int   kMinGoodMatches  = 8;
+constexpr float kRansacReproj    = 5.0f;
 // faint face/hair tint.
 constexpr int   kPersonMaskDilatePx = 40;
 
@@ -60,7 +51,7 @@ std::vector<AlignedFrame> alignToReference(
     // gate, and warping all still operate in full-resolution coordinate space
     // (no threshold tuning needed). Sub-pixel residual from this is ~1–2 full-
     // pixels, which the ECC refinement below pulls back down.
-    const int detectScale = std::max(1, refGray.cols / 240);
+    const int detectScale = std::max(1, refGray.cols / 360); // Downscale to 360px wide instead of 240px to reduce sub-pixel jitter
     const cv::Size detectSize(refGray.cols / detectScale,
                               refGray.rows / detectScale);
     cv::Mat refGrayDetect;
@@ -69,10 +60,21 @@ std::vector<AlignedFrame> alignToReference(
     } else {
         refGrayDetect = refGray;
     }
-    cv::Mat refMaskFull = invertMask(reference.anyPersonMask);
+    
+    // Pre-dilate reference person mask by a moderate kernel to avoid boundary keypoint leakage
+    cv::Mat dilatedRefPersonMask;
+    if (!reference.anyPersonMask.empty()) {
+        cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(21, 21));
+        cv::dilate(reference.anyPersonMask, dilatedRefPersonMask, kern);
+    } else {
+        dilatedRefPersonMask = reference.anyPersonMask;
+    }
+    cv::Mat refMaskFull = invertMask(dilatedRefPersonMask);
     cv::Mat refMaskDetect;
     if (!refMaskFull.empty() && detectScale > 1) {
-        cv::resize(refMaskFull, refMaskDetect, detectSize, 0, 0, cv::INTER_NEAREST);
+        // Use linear interpolation and strict thresholding to completely exclude person boundary pixels
+        cv::resize(refMaskFull, refMaskDetect, detectSize, 0, 0, cv::INTER_LINEAR);
+        cv::threshold(refMaskDetect, refMaskDetect, 240, 255, cv::THRESH_BINARY);
     } else {
         refMaskDetect = refMaskFull;
     }
@@ -90,7 +92,7 @@ std::vector<AlignedFrame> alignToReference(
     }
 
     if (detectScale > 1 && !refDescOrb.empty()) {
-        const float sx = static_cast<float>(detectScale);
+        const auto sx = static_cast<float>(detectScale);
         for (auto& kp : refKpsOrb) {
             kp.pt.x *= sx;
             kp.pt.y *= sx;
@@ -116,7 +118,7 @@ std::vector<AlignedFrame> alignToReference(
         akaze->detectAndCompute(refGrayAkaze, cv::noArray(), refKpsAkaze, refDescAkaze);
     }
     if (akaze_scale > 1 && !refDescAkaze.empty()) {
-        const float sx = static_cast<float>(akaze_scale);
+        const auto sx = static_cast<float>(akaze_scale);
         for (auto& kp : refKpsAkaze) {
             kp.pt.x *= sx;
             kp.pt.y *= sx;
@@ -146,7 +148,33 @@ std::vector<AlignedFrame> alignToReference(
 
         cv::Mat gray;
         cv::cvtColor(f.image, gray, cv::COLOR_RGB2GRAY);
-        cv::Mat candMaskFull = invertMask(f.anyPersonMask);
+
+        // Pre-dilate candidate person mask to avoid boundary keypoint leakage
+        cv::Mat dilatedCandPersonMask;
+        if (!f.anyPersonMask.empty()) {
+            cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(21, 21));
+            cv::dilate(f.anyPersonMask, dilatedCandPersonMask, kern);
+        } else {
+            dilatedCandPersonMask = f.anyPersonMask;
+        }
+        cv::Mat candMaskFull = invertMask(dilatedCandPersonMask);
+
+        // Detect-scale gray + mask, hoisted out of the ORB block so the
+        // post-RANSAC ECC refinement can reuse them without recomputing.
+        // Cost: one INTER_AREA resize per frame regardless of tier reached.
+        cv::Mat grayDetect;
+        if (detectScale > 1) {
+            cv::resize(gray, grayDetect, detectSize, 0, 0, cv::INTER_AREA);
+        } else {
+            grayDetect = gray;
+        }
+        cv::Mat candMaskDetect;
+        if (!candMaskFull.empty() && detectScale > 1) {
+            cv::resize(candMaskFull, candMaskDetect, detectSize, 0, 0, cv::INTER_LINEAR);
+            cv::threshold(candMaskDetect, candMaskDetect, 240, 255, cv::THRESH_BINARY);
+        } else {
+            candMaskDetect = candMaskFull;
+        }
 
         std::vector<cv::KeyPoint> kps;
         std::vector<cv::KeyPoint> refKpsUsed;
@@ -155,19 +183,6 @@ std::vector<AlignedFrame> alignToReference(
 
         // Tier 1: ORB
         if (!refDescOrb.empty()) {
-            cv::Mat grayDetect;
-            if (detectScale > 1) {
-                cv::resize(gray, grayDetect, detectSize, 0, 0, cv::INTER_AREA);
-            } else {
-                grayDetect = gray;
-            }
-            cv::Mat candMaskDetect;
-            if (!candMaskFull.empty() && detectScale > 1) {
-                cv::resize(candMaskFull, candMaskDetect, detectSize, 0, 0, cv::INTER_NEAREST);
-            } else {
-                candMaskDetect = candMaskFull;
-            }
-
             cv::Mat desc;
             orb->detectAndCompute(grayDetect, candMaskDetect, kps, desc);
             if (desc.empty() && !candMaskDetect.empty()) {
@@ -176,7 +191,7 @@ std::vector<AlignedFrame> alignToReference(
             }
             if (!desc.empty()) {
                 if (detectScale > 1) {
-                    const float sx = static_cast<float>(detectScale);
+                    const auto sx = static_cast<float>(detectScale);
                     for (auto& kp : kps) { kp.pt.x *= sx; kp.pt.y *= sx; }
                 }
                 matcherHamming.match(desc, refDescOrb, matches);
@@ -205,7 +220,7 @@ std::vector<AlignedFrame> alignToReference(
             }
             if (!desc.empty()) {
                 if (akaze_scale > 1) {
-                    const float sx = static_cast<float>(akaze_scale);
+                    const auto sx = static_cast<float>(akaze_scale);
                     for (auto& kp : kps) { kp.pt.x *= sx; kp.pt.y *= sx; }
                 }
                 matches.clear();
@@ -217,7 +232,75 @@ std::vector<AlignedFrame> alignToReference(
             }
         }
 
-        if (tier == 0) { out.push_back(std::move(af)); continue; }
+        if (tier == 0) {
+            // Gyro fallback: when no features matched (texture-poor scene)
+            // but both ref and cand carry a gyro rotation, synthesize H
+            // directly from the relative rotation. Pure-rotation model is
+            // exact for distant scenes; for near-field scenes it produces
+            // residual parallax but still beats "no alignment at all".
+            //
+            // Approximate intrinsics: focal_length ≈ max(W, H), principal
+            // point at image center. Real K from CameraCharacteristics
+            // would be more accurate but device-dependent and not always
+            // exposed; the approximation is good enough for the typical
+            // ~30° handheld FOV.
+            if (!reference.rotation.empty() && !f.rotation.empty()) {
+                cv::Mat Rrel = reference.rotation.t() * f.rotation;
+                const double fLen = static_cast<double>(
+                        std::max(refSize.width, refSize.height));
+                const double cx = refSize.width * 0.5;
+                const double cy = refSize.height * 0.5;
+                cv::Mat K = (cv::Mat_<double>(3, 3) <<
+                             fLen, 0.0,  cx,
+                             0.0,  fLen, cy,
+                             0.0,  0.0,  1.0);
+                cv::Mat Kinv = K.inv();
+                cv::Mat H = K * Rrel * Kinv;
+
+                cv::warpPerspective(f.image, af.image, H, refSize, cv::INTER_LINEAR);
+
+                cv::Mat preDilatedMask;
+                if (!f.anyPersonMask.empty()) {
+                    cv::Mat kern = cv::getStructuringElement(
+                            cv::MORPH_ELLIPSE,
+                            cv::Size(2 * kPersonMaskDilatePx + 1,
+                                     2 * kPersonMaskDilatePx + 1));
+                    cv::dilate(f.anyPersonMask, preDilatedMask, kern);
+                } else {
+                    preDilatedMask = f.anyPersonMask;
+                }
+                if (!preDilatedMask.empty()) {
+                    cv::warpPerspective(preDilatedMask, af.anyPersonMask, H,
+                                        refSize, cv::INTER_NEAREST);
+                } else {
+                    af.anyPersonMask = cv::Mat::zeros(refSize, CV_8UC1);
+                }
+                af.personMasks.reserve(f.personMasks.size());
+                for (const auto& m : f.personMasks) {
+                    cv::Mat dilated, warped;
+                    cv::Mat kern = cv::getStructuringElement(
+                            cv::MORPH_ELLIPSE,
+                            cv::Size(2 * kPersonMaskDilatePx + 1,
+                                     2 * kPersonMaskDilatePx + 1));
+                    cv::dilate(m, dilated, kern);
+                    cv::warpPerspective(dilated, warped, H, refSize, cv::INTER_NEAREST);
+                    af.personMasks.push_back(std::move(warped));
+                }
+                {
+                    cv::Mat ones(f.image.size(), CV_8UC1, cv::Scalar(255));
+                    cv::warpPerspective(ones, af.validMask, H, refSize, cv::INTER_NEAREST);
+                }
+                // Gyro accumulates drift over the buffer window; mark
+                // conservatively so the stitcher's hi-quality bucket
+                // de-prefers these samples unless nothing else is available.
+                af.quality = 0.3f;
+                af.valid = true;
+                LOGD("aligner: tier=0 → using gyro-derived H fallback");
+                out.push_back(std::move(af));
+                continue;
+            }
+            out.push_back(std::move(af)); continue;
+        }
 
         // 3. Build point correspondences for RANSAC homography.
         std::vector<cv::Point2f> srcPts, dstPts;
@@ -229,26 +312,33 @@ std::vector<AlignedFrame> alignToReference(
         }
 
         cv::Mat inlierMask;
-        cv::Mat H = cv::findHomography(srcPts, dstPts, cv::RANSAC, kRansacReproj, inlierMask);
+        // RANSAC iters capped at 500 (default 2000). Handheld photo domain
+        // converges well within 500; the extra 1500 iters mostly burn CPU.
+        // Confidence 0.995 balances reliability vs cost.
+        cv::Mat H = cv::findHomography(srcPts, dstPts, cv::RANSAC, kRansacReproj,
+                                       inlierMask, /*maxIters=*/500,
+                                       /*confidence=*/0.995);
         if (H.empty()) { out.push_back(std::move(af)); continue; }
 
         // findHomography returns a non-empty matrix even when RANSAC supported it
         // with very few inliers (sky / blank-wall scenes). Reject the result
         // unless enough matches actually agreed with the fitted model.
-        int inliers = inlierMask.empty() ? 0 : cv::countNonZero(inlierMask);
+        int inliers = cv::countNonZero(inlierMask);
         if (inliers < kMinGoodMatches) {
             LOGD("aligner: only %d inliers (need >= %d)", inliers, kMinGoodMatches);
             out.push_back(std::move(af));
             continue;
         }
 
-        // Sanity-check the affine block's scale. A wildly extreme transform
-        // (e.g. squashing the frame to a sliver) means RANSAC fit garbage; the
-        // resulting warp would contribute nothing usable to the stitch.
+        // Sanity-check the affine block's scale. Handheld photos within the
+        // ring-buffer window have ~negligible zoom; det should sit in [0.85,
+        // 1.15] for normal captures. Tightened range [0.5, 2.0] rejects
+        // garbage RANSAC fits (extreme shear/perspective) without false-
+        // positives on legitimate handheld motion.
         double a = H.at<double>(0, 0), b = H.at<double>(0, 1);
         double c = H.at<double>(1, 0), d = H.at<double>(1, 1);
         double scaleDet = std::abs(a * d - b * c);
-        if (scaleDet < 0.05 || scaleDet > 20.0) {
+        if (scaleDet < 0.5 || scaleDet > 2.0) {
             LOGD("aligner: rejecting H with extreme scale (det=%.3f)", scaleDet);
             out.push_back(std::move(af));
             continue;
@@ -262,9 +352,12 @@ std::vector<AlignedFrame> alignToReference(
         // direction, and the median smears into the wavy/blurred upper-area
         // patch we keep seeing.
         //
-        // Compute mean inlier reprojection error; reject if > 1.5 px. That
-        // cuts the worst marginal homographies (those near the RANSAC
-        // ceiling) while keeping the well-fit ones (errors < 1 px).
+        // Compute mean inlier reprojection error; reject if > 2.5 px. Noise
+        // floor at detectScale=cols/360 is ~1.5–2 px when projected back to
+        // full coordinates (sub-px ORB jitter × scale factor). Gate at 2.5
+        // lets clean fits through while still cutting the genuinely bad
+        // homographies (extreme scale, low inlier, > 3 px residual).
+        double meanReprojError = 0.0;
         {
             std::vector<cv::Point2f> projected;
             cv::perspectiveTransform(srcPts, projected, H);
@@ -278,10 +371,10 @@ std::vector<AlignedFrame> alignToReference(
                 sumError += std::sqrt(dx * dx + dy * dy);
                 ++counted;
             }
-            const double meanError = (counted > 0) ? (sumError / counted) : 999.0;
-            if (meanError > 5.0) {
+            meanReprojError = (counted > 0) ? (sumError / counted) : 999.0;
+            if (meanReprojError > 2.5) {
                 LOGD("aligner: rejecting H with mean reproj error %.2f px "
-                     "(inliers=%d)", meanError, counted);
+                     "(inliers=%d)", meanReprojError, counted);
                 out.push_back(std::move(af));
                 continue;
             }
@@ -311,16 +404,83 @@ std::vector<AlignedFrame> alignToReference(
         // ~24 px at 480 wide, ~12 px at 240 wide. Above that the frame's
         // contribution to the median is more likely to be ghost than signal.
         {
-            const double tx = H.at<double>(0, 2);
-            const double ty = H.at<double>(1, 2);
-            const double translation = std::sqrt(tx * tx + ty * ty);
+            // Measure how far the IMAGE CENTER moves under H. The (0,2)/(1,2)
+            // entries are shift at pixel (0,0) and conflate rotation/scale —
+            // a frame with mild center motion + slight tilt can show
+            // hundreds of px at the origin while the actual scene shift is
+            // tiny. Center displacement reflects real parallax risk.
+            std::vector<cv::Point2f> centerSrc = {
+                cv::Point2f(refSize.width * 0.5f, refSize.height * 0.5f)
+            };
+            std::vector<cv::Point2f> centerDst;
+            cv::perspectiveTransform(centerSrc, centerDst, H);
+            const double dx = centerDst[0].x - centerSrc[0].x;
+            const double dy = centerDst[0].y - centerSrc[0].y;
+            const double translation = std::sqrt(dx * dx + dy * dy);
             const double translationLimit = refSize.width * 0.15;
             if (translation > translationLimit) {
-                LOGD("aligner: rejecting frame with translation %.1f px "
+                LOGD("aligner: rejecting frame with center shift %.1f px "
                      "(limit %.1f) — too much parallax risk",
                      translation, translationLimit);
                 out.push_back(std::move(af));
                 continue;
+            }
+        }
+
+        // 3.5. ECC sub-pixel refinement. RANSAC's feature-driven H sits at
+        // pixel-level accuracy; the per-feature sub-pixel jitter (≈ 0.5 px at
+        // detect scale × scale factor when projected to full coords) becomes
+        // the noise floor for downstream temporal-median sharpness. ECC
+        // optimizes intensity correlation between the warped candidate and
+        // the reference, refining H to sub-pixel accuracy.
+        //
+        // Run at detect scale to bound cost — full-res ECC on 1080×1920 is
+        // too slow for ~15 frames per capture. Detect-scale gray + combined
+        // (ref ∩ cand) non-person mask focuses ECC on bg pixels only.
+        //
+        // Skip for AKAZE tier (texture-poor scenes where ECC's intensity
+        // correlation is unreliable). Skip on exception (no convergence).
+        if (tier == 1) {
+            cv::Mat Hdown = H.clone();
+            const double s = static_cast<double>(detectScale);
+            if (detectScale > 1) {
+                // H_down = S^-1 * H_full * S, where S = diag(s,s,1).
+                Hdown.at<double>(0, 2) /= s;
+                Hdown.at<double>(1, 2) /= s;
+                Hdown.at<double>(2, 0) *= s;
+                Hdown.at<double>(2, 1) *= s;
+            }
+            Hdown.convertTo(Hdown, CV_32F);
+
+            // Mask pixels that are non-person in BOTH reference and candidate.
+            cv::Mat eccMask;
+            if (!refMaskDetect.empty() && !candMaskDetect.empty()) {
+                cv::bitwise_and(refMaskDetect, candMaskDetect, eccMask);
+            } else if (!candMaskDetect.empty()) {
+                eccMask = candMaskDetect;
+            } else if (!refMaskDetect.empty()) {
+                eccMask = refMaskDetect;
+            }
+
+            try {
+                cv::TermCriteria criteria(
+                        cv::TermCriteria::EPS | cv::TermCriteria::COUNT,
+                        /*maxCount=*/5, /*epsilon=*/0.001);
+                cv::findTransformECC(refGrayDetect, grayDetect, Hdown,
+                                     cv::MOTION_HOMOGRAPHY, criteria, eccMask, 5);
+
+                Hdown.convertTo(Hdown, CV_64F);
+                if (detectScale > 1) {
+                    // Scale back: H_full = S * H_down * S^-1.
+                    Hdown.at<double>(0, 2) *= s;
+                    Hdown.at<double>(1, 2) *= s;
+                    Hdown.at<double>(2, 0) /= s;
+                    Hdown.at<double>(2, 1) /= s;
+                }
+                H = Hdown;
+            } catch (const cv::Exception&) {
+                // ECC failed to converge — keep the RANSAC H, which already
+                // passed all gates above.
             }
         }
 
@@ -332,7 +492,7 @@ std::vector<AlignedFrame> alignToReference(
         cv::warpPerspective(f.image, af.image, H, refSize, cv::INTER_LINEAR);
 
         cv::Mat preDilatedMask;
-        if (!f.anyPersonMask.empty() && kPersonMaskDilatePx > 0) {
+        if (!f.anyPersonMask.empty()) {
             cv::Mat kern = cv::getStructuringElement(
                     cv::MORPH_ELLIPSE,
                     cv::Size(2 * kPersonMaskDilatePx + 1, 2 * kPersonMaskDilatePx + 1));
@@ -350,14 +510,10 @@ std::vector<AlignedFrame> alignToReference(
         af.personMasks.reserve(f.personMasks.size());
         for (const auto& m : f.personMasks) {
             cv::Mat dilated, warped;
-            if (kPersonMaskDilatePx > 0) {
-                cv::Mat kern = cv::getStructuringElement(
-                        cv::MORPH_ELLIPSE,
-                        cv::Size(2 * kPersonMaskDilatePx + 1, 2 * kPersonMaskDilatePx + 1));
-                cv::dilate(m, dilated, kern);
-            } else {
-                dilated = m;
-            }
+            cv::Mat kern = cv::getStructuringElement(
+                    cv::MORPH_ELLIPSE,
+                    cv::Size(2 * kPersonMaskDilatePx + 1, 2 * kPersonMaskDilatePx + 1));
+            cv::dilate(m, dilated, kern);
             cv::warpPerspective(dilated, warped, H, refSize, cv::INTER_NEAREST);
             af.personMasks.push_back(std::move(warped));
         }
@@ -370,6 +526,13 @@ std::vector<AlignedFrame> alignToReference(
             cv::warpPerspective(ones, af.validMask, H, refSize, cv::INTER_NEAREST);
         }
 
+        // Quality ∈ (0, 1]. Falls off as RANSAC mean reprojection error
+        // grows. At meanError=0 (perfect fit) quality=1; at 1px → 0.5; at
+        // 2px → 0.33. ECC refinement after this point further tightens the
+        // warp but we don't re-measure residual — quality remains a
+        // conservative lower bound. Stitcher uses this to prefer
+        // higher-quality samples when many candidates are available.
+        af.quality = static_cast<float>(1.0 / (1.0 + meanReprojError));
         af.valid = true;
         out.push_back(std::move(af));
     }

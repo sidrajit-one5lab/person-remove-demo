@@ -117,7 +117,8 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
         jlong handle,
         jbyteArray rgba, jint width, jint height,
         jobjectArray personMasks,
-        jlong timestampMs) {
+        jlong timestampMs,
+        jfloatArray rotation9) {
 
     auto* s = asSession(handle);
     if (!s) {
@@ -127,6 +128,19 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
 
     BufferedFrame f;
     f.timestampMs = timestampMs;
+
+    // Optional gyro rotation, row-major float[9]. Stored as CV_64FC1 3x3
+    // so aligner can use double-precision arithmetic when composing with
+    // intrinsics. Empty when caller passes null (no gyro available).
+    if (rotation9 != nullptr && env->GetArrayLength(rotation9) >= 9) {
+        jfloat* rp = env->GetFloatArrayElements(rotation9, nullptr);
+        if (rp != nullptr) {
+            cv::Mat R(3, 3, CV_64FC1);
+            for (int i = 0; i < 9; ++i) R.at<double>(i / 3, i % 3) = rp[i];
+            f.rotation = R;
+            env->ReleaseFloatArrayElements(rotation9, rp, JNI_ABORT);
+        }
+    }
 
     // ---- 1. RGBA → RGB cv::Mat (drop alpha; we never use it).
     {
@@ -397,33 +411,30 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     auto result = stitch(reference, dilatedHole, aligned);
     auto t2 = clk::now();
 
-    // Stage 5 (lighting / exposure drift): shift the patched region's mean
-    // toward the reference's boundary mean. Fixes the "blueish tint" caused
-    // by AWB drift across the buffer window. No-op if the rings are too thin.
-    // Wider band (24px) to average over more surrounding context — reduces
-    // bias from localized shadow gradients at the hole boundary.
-    matchStitchToReferenceTint(result.image, reference.image, dilatedHole, 24);
-
     // Sharpness recovery: unsharp mask inside the hole. The temporal median
     // averages sub-pixel-misaligned samples, which softens edges and texture.
-    // This restores most of it without amplifying noise. Applied BEFORE the
-    // boundary feather so the feather's smooth transition isn't ringed by
-    // sharpening.
+    // Applied BEFORE the multi-band blend so the high-freq detail enters the
+    // pyramid intact; the blend's top band carries it through to output.
+    // boundarySkipPx erodes the application region so unsharp doesn't reach
+    // outside-hole pixels (which would create a halo).
     unsharpMaskInHole(result.image, dilatedHole);
 
-    // Noise floor matching: the median also averages out sensor noise, so the
-    // patched area reads as artificially smooth on featureless surfaces (white
-    // walls / sky). Re-inject gaussian noise at the same std-dev the reference
-    // has just outside the hole. Without this, large patches on smooth surfaces
-    // look "too clean" and the eye picks them out even when everything else
-    // is correct.
+    // Noise floor matching: the median averages out sensor noise, so the
+    // patched area reads as artificially smooth on featureless surfaces
+    // (white walls / sky). Re-inject gaussian noise at the same std-dev the
+    // reference has just outside the hole. Done before the blend so the
+    // injected noise propagates through pyramid levels at the correct scale.
     matchNoiseToReferenceSurround(result.image, reference.image, dilatedHole);
 
-    // Stage 6 (seam blending): soft feather across the hole boundary so the
-    // stitched→original transition isn't a hard cut. The dilation already
-    // pushed the boundary well past the silhouette, so no person leaks in.
-    // Wider feather (25px) to smooth the larger dilation boundary.
-    featherStitchBoundary(result.image, reference.image, dilatedHole, 25);
+    // Stage 5+6 combined (lighting + seam): multi-band Laplacian pyramid
+    // blend. Fuses the stitched hole region with the reference outside via
+    // Burt-Adelson pyramid blending. The low-freq bands carry mean/tint —
+    // they automatically match the surrounding context, replacing the
+    // constant-offset matchStitchToReferenceTint that produced visible
+    // bright/dark boxes on multi-region holes. The high-freq bands carry
+    // texture/detail. The boundary blends smoothly across the pyramid's
+    // built-in Gaussian-weighted mask, replacing featherStitchBoundary.
+    multiBandBlendStitch(result.image, reference.image, dilatedHole);
     auto t3 = clk::now();
 
     auto alignMs  = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
@@ -447,7 +458,8 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     jbyteArray junfilled  = env->NewByteArray(static_cast<jsize>(maskLen));
     jbyteArray jhole      = env->NewByteArray(static_cast<jsize>(maskLen));
     jintArray  jdims      = env->NewIntArray(2);
-    jfloatArray jratio    = env->NewFloatArray(1);
+    // [0] = realFillRatio, [1] = noSampleRatio (hist0 / totalHole).
+    jfloatArray jratio    = env->NewFloatArray(2);
     if (!jrgb || !joriginal || !junfilled || !jhole || !jdims || !jratio) return false;
 
     env->SetByteArrayRegion(jrgb, 0, static_cast<jsize>(rgbLen),
@@ -463,8 +475,8 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
 
     jint dims[2] = { W, H };
     env->SetIntArrayRegion(jdims, 0, 2, dims);
-    jfloat ratio = result.realFillRatio;
-    env->SetFloatArrayRegion(jratio, 0, 1, &ratio);
+    jfloat ratios[2] = { result.realFillRatio, result.noSampleRatio };
+    env->SetFloatArrayRegion(jratio, 0, 2, ratios);
 
     env->SetObjectArrayElement(outArr, 0, jrgb);
     env->SetObjectArrayElement(outArr, 1, joriginal);
@@ -500,9 +512,12 @@ Java_com_one5_personremoval_core_NativeSession_nativeStitchForInpaint(
 }
 
 /**
- * OpenCV cv::inpaint fallback used if LaMa fails. Uses Telea's method — fast,
- * acceptable for small holes, visibly bad for big ones. The whole point is to
- * always produce *some* result so the app never ships an empty pixel region.
+ * OpenCV cv::inpaint fallback used if LaMa fails. Uses Navier-Stokes method —
+ * solves a fluid-flow PDE that propagates isophotes (lines of equal intensity)
+ * into the hole. Smoother and less streaky than Telea (cv::INPAINT_TELEA) on
+ * large holes, especially across textured boundaries. Slightly slower than
+ * Telea but well within budget. The whole point is to always produce *some*
+ * result so the app never ships an empty pixel region.
  *
  * @param rgb   raw RGB bytes, w*h*3
  * @param mask  raw mask bytes, w*h, non-zero = inpaint here
@@ -543,7 +558,7 @@ Java_com_one5_personremoval_core_NativeSession_nativeOpencvInpaint(
 
     cv::Mat inpainted;
     try {
-        cv::inpaint(bgr, maskMat, inpainted, 3.0, cv::INPAINT_TELEA);
+        cv::inpaint(bgr, maskMat, inpainted, 3.0, cv::INPAINT_NS);
     } catch (const cv::Exception& e) {
         LOGE("cv::inpaint threw: %s", e.what());
         env->ReleaseByteArrayElements(rgb, rgbPtr, JNI_ABORT);
@@ -760,28 +775,80 @@ Java_com_one5_personremoval_core_NativeSession_nativeCompositeHighRes(
     env->ReleaseByteArrayElements(lowResStitched, lowStPtr, JNI_ABORT);
     env->ReleaseByteArrayElements(lowResMask, lowMaskPtr, JNI_ABORT);
 
-    // ---- 4. Composite with a feathered boundary. --------------------------
-    // The feather kernel scales with the high-res dimensions: at 12 MP the
-    // patch is ~2000 px across, so a 31-px feather is proportionally similar
-    // to the 15-px feather we use at low-res (240-wide). On smaller images
-    // it floors to a sensible minimum.
-    const int featherRadius = std::max(15, std::min(highRes.cols, highRes.rows) / 64);
-    const int featherKsz = 2 * featherRadius + 1;
-    cv::Mat alpha8;
-    cv::GaussianBlur(upMask, alpha8, cv::Size(featherKsz, featherKsz), 0);
-    cv::Mat alphaF;
-    alpha8.convertTo(alphaF, CV_32F, 1.0 / 255.0);
-
-    cv::Mat highRes32, up32;
-    highRes.convertTo(highRes32, CV_32FC3);
-    upStitched.convertTo(up32, CV_32FC3);
-    std::vector<cv::Mat> ach{alphaF, alphaF, alphaF};
-    cv::Mat alpha3;
-    cv::merge(ach, alpha3);
-    cv::Mat blended32 = up32.mul(alpha3) + highRes32.mul(cv::Scalar::all(1) - alpha3);
-
+    // ---- 4. Composite via Poisson seamless clone at hi-res. ---------------
+    // cv::seamlessClone solves the Poisson equation to insert the upscaled
+    // patch with the surrounding hi-res sensor pixels providing the
+    // gradient-domain boundary condition. Result: smooth tone/color/lighting
+    // match at the patch boundary even if the analyzer-tier upStitched
+    // disagrees with the ISP-processed highRes JPEG (different tone curve,
+    // sharpening, NR). Replaces the bicubic + Gaussian-alpha blend that
+    // produced a visible "haze ring" at the patch boundary.
+    //
+    // Constraints (handled below):
+    //   - Mask must not touch the image border. Pad mask interior by 2px.
+    //   - Mask must be CV_8UC1 binary {0, 255} (we already threshold above).
+    //   - Mask must have non-trivial area (>200 px) and sane bounding rect.
+    //   - seamlessClone occasionally throws on degenerate mask topology.
+    //     Fall back to the old alpha blend on any exception.
     cv::Mat result;
-    blended32.convertTo(result, CV_8UC3);
+    bool poissonOk = false;
+    {
+        // Build a safe mask copy: clear a 2-px ring at the image border so
+        // seamlessClone's internal Laplacian solve doesn't hit the edge.
+        cv::Mat safeMask = upMask.clone();
+        safeMask.row(0).setTo(0);
+        safeMask.row(safeMask.rows - 1).setTo(0);
+        safeMask.col(0).setTo(0);
+        safeMask.col(safeMask.cols - 1).setTo(0);
+        if (safeMask.rows > 2 && safeMask.cols > 2) {
+            safeMask.row(1).setTo(0);
+            safeMask.row(safeMask.rows - 2).setTo(0);
+            safeMask.col(1).setTo(0);
+            safeMask.col(safeMask.cols - 2).setTo(0);
+        }
+
+        const int maskPx = cv::countNonZero(safeMask);
+        if (maskPx > 200) {
+            const cv::Rect bbox = cv::boundingRect(safeMask);
+            const cv::Point center(bbox.x + bbox.width / 2,
+                                   bbox.y + bbox.height / 2);
+            try {
+                cv::seamlessClone(upStitched, highRes, safeMask, center,
+                                  result, cv::NORMAL_CLONE);
+                poissonOk = !result.empty();
+            } catch (const cv::Exception& e) {
+                LOGW("compositeHighRes: seamlessClone (cv) threw: %s", e.what());
+            } catch (const std::exception& e) {
+                LOGW("compositeHighRes: seamlessClone (std) threw: %s", e.what());
+            }
+        } else {
+            LOGW("compositeHighRes: hi-res mask too sparse (%d px) for seamlessClone",
+                 maskPx);
+        }
+    }
+
+    if (!poissonOk) {
+        // Fallback: original Gaussian-feathered alpha blend. Maintains the
+        // pre-Poisson behavior for any edge case (mask touches border on
+        // both axes, degenerate topology, seamlessClone implementation bug).
+        const int featherRadius = std::max(15, std::min(highRes.cols, highRes.rows) / 64);
+        const int featherKsz = 2 * featherRadius + 1;
+        cv::Mat alpha8;
+        cv::GaussianBlur(upMask, alpha8, cv::Size(featherKsz, featherKsz), 0);
+        cv::Mat alphaF;
+        alpha8.convertTo(alphaF, CV_32F, 1.0 / 255.0);
+
+        cv::Mat highRes32, up32;
+        highRes.convertTo(highRes32, CV_32FC3);
+        upStitched.convertTo(up32, CV_32FC3);
+        std::vector<cv::Mat> ach{alphaF, alphaF, alphaF};
+        cv::Mat alpha3;
+        cv::merge(ach, alpha3);
+        cv::Mat blended32 = up32.mul(alpha3) +
+                            highRes32.mul(cv::Scalar::all(1) - alpha3);
+        blended32.convertTo(result, CV_8UC3);
+        LOGI("compositeHighRes: fell back to feather blend (radius=%d)", featherRadius);
+    }
 
     // ---- 5. JPEG-encode. --------------------------------------------------
     std::vector<uchar> jpegOut;
@@ -793,8 +860,9 @@ Java_com_one5_personremoval_core_NativeSession_nativeCompositeHighRes(
 
     auto t1 = clk::now();
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    LOGI("compositeHighRes: high=%dx%d low=%dx%d feather=%d %lldms jpegBytes=%zu",
-         highRes.cols, highRes.rows, lowW, lowH, featherRadius,
+    LOGI("compositeHighRes: high=%dx%d low=%dx%d method=%s %lldms jpegBytes=%zu",
+         highRes.cols, highRes.rows, lowW, lowH,
+         poissonOk ? "poisson" : "feather",
          (long long)ms, jpegOut.size());
 
     jbyteArray result_out = env->NewByteArray(static_cast<jsize>(jpegOut.size()));

@@ -24,6 +24,12 @@ struct StitchResult {
     cv::Mat stillUnfilled;
     cv::Mat sampleCount;
     float   realFillRatio = 0.f;
+    // Fraction of hole pixels with ZERO clean-bg samples across the buffer
+    // (the hist0 bucket). Distinct from (1 - realFillRatio), which also
+    // counts pixels with 1-2 marginal samples. A high noSampleRatio means
+    // no amount of buffer waiting will recover those pixels — the subject
+    // never moved off them. UI uses this to prompt "step aside briefly".
+    float   noSampleRatio  = 0.f;
 };
 
 /**
@@ -40,12 +46,37 @@ struct StitchResult {
  * mean, less likely to bias one channel asymmetrically.
  *
  * Operates in place on [stitched]. Outside [holeMask] the image is untouched.
+ *
+ * SUPERSEDED by multiBandBlendStitch() for large multi-region holes. The
+ * constant-offset shift causes a visible "bright box" at the hole shape when
+ * inner/outer ring samples disagree. Kept for narrow holes where multi-band
+ * pyramid construction is unstable.
  */
 void matchStitchToReferenceTint(
         cv::Mat& stitched,
         const cv::Mat& reference,
         const cv::Mat& holeMask,
         int bandPx = 16);
+
+/**
+ * Multi-band (Laplacian pyramid) blend: fuses the patched hole region with the
+ * reference outside the hole using cv::detail::MultiBandBlender. The pyramid
+ * decomposes both images into spatial frequency bands and blends each band
+ * separately, so low-frequency mean/tint differences match the surroundings
+ * naturally while high-frequency texture inside the hole is preserved.
+ *
+ * Replaces matchStitchToReferenceTint (constant offset) and
+ * featherStitchBoundary (gaussian alpha seam) for typical large-hole captures.
+ * Works correctly across multi-region holes where a constant offset would
+ * produce a visible bright/dark patch.
+ *
+ * Operates in place on [stitched]. No-op on OpenCV exception (caller can apply
+ * legacy seam ops as backup).
+ */
+void multiBandBlendStitch(
+        cv::Mat& stitched,
+        const cv::Mat& reference,
+        const cv::Mat& holeMask);
 
 /**
  * Stage 6 (seam blending): gaussian-feathered alpha-blend across the hole

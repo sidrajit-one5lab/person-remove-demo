@@ -4,8 +4,14 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.hardware.camera2.CaptureRequest
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
@@ -68,6 +74,21 @@ class CameraManager(private val context: Context) {
     // produces a full-sensor JPEG that we composite the patched region into.
     private var imageCapture: ImageCapture? = null
 
+    // Bound Camera handle for Camera2 interop (AE/AWB lock).
+    private var boundCamera: Camera? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val lockRunnable = Runnable {
+        applyExposureLock(true)
+        onExposureLocked?.invoke()
+    }
+
+    /**
+     * Fires on the main thread right after AE/AWB lock is applied. Set by the
+     * ViewModel to clear the native ring buffer so only post-lock (consistent-
+     * exposure) frames enter the temporal-median stitch.
+     */
+    var onExposureLocked: (() -> Unit)? = null
+
     fun bind(
         owner: LifecycleOwner,
         previewView: PreviewView,
@@ -102,7 +123,7 @@ class CameraManager(private val context: Context) {
             val provider = future.get()
 
             val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
+                it.surfaceProvider = previewView.surfaceProvider
             }
 
             // Analyzer resolution at ~FHD. The high-res ImageCapture composite
@@ -157,7 +178,9 @@ class CameraManager(private val context: Context) {
             imageCapture = capture
 
             provider.unbindAll()
-            try {
+            mainHandler.removeCallbacks(lockRunnable)
+            boundCamera = null
+            boundCamera = try {
                 provider.bindToLifecycle(owner, selector, preview, analysis, capture)
             } catch (t: Throwable) {
                 // Some devices restrict the combination of bound use cases.
@@ -167,7 +190,29 @@ class CameraManager(private val context: Context) {
                 imageCapture = null
                 provider.bindToLifecycle(owner, selector, preview, analysis)
             }
+            // Let AE/AWB converge, then lock so exposure/white-balance stop
+            // flickering frame-to-frame. Critical for the temporal median
+            // stitch: varying exposure between buffered frames bakes seams
+            // into the stitched background.
+            mainHandler.postDelayed(lockRunnable, AE_SETTLE_MS)
         }, ContextCompat.getMainExecutor(context))
+    }
+
+    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    private fun applyExposureLock(lock: Boolean) {
+        val cam = boundCamera ?: return
+        val opts = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, lock)
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, lock)
+            .build()
+        Camera2CameraControl.from(cam.cameraControl).setCaptureRequestOptions(opts)
+    }
+
+    /** Re-converge AE/AWB then re-lock. Call when lighting changes (e.g. user moves). */
+    fun relockExposure() {
+        mainHandler.removeCallbacks(lockRunnable)
+        applyExposureLock(false)
+        mainHandler.postDelayed(lockRunnable, AE_SETTLE_MS)
     }
 
     /**
@@ -227,11 +272,15 @@ class CameraManager(private val context: Context) {
 
     private companion object {
         const val TAG = "CameraManager"
+        // Time for 3A (AE/AWB) to converge before locking. ~600 ms covers most
+        // devices; too short leaves AE mid-ramp, too long delays the user.
+        const val AE_SETTLE_MS = 600L
     }
 
     fun shutdown() {
         // Close any frame still parked in the mailbox so its underlying buffer is
         // returned to CameraX before the executor goes away.
+        mainHandler.removeCallbacks(lockRunnable)
         latest.getAndSet(null)?.close()
         analysisExecutor.shutdown()
     }

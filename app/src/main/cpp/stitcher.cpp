@@ -1,8 +1,10 @@
 #include "stitcher.h"
 
 #include <algorithm>
+#include <cmath>
 #include <android/log.h>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/stitching/detail/blenders.hpp>
 
 #define LOG_TAG "PRNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -41,12 +43,37 @@ StitchResult stitch(
     result.stillUnfilled = cv::Mat::zeros(H, W, CV_8UC1);
     result.sampleCount = cv::Mat::zeros(H, W, CV_8UC1);
 
-    // Scratch buffers reused across pixels to avoid alloc churn.
-    std::vector<uchar> rs, gs, bs;
-    const size_t maxSamples = aligned.size();
-    rs.reserve(maxSamples);
-    gs.reserve(maxSamples);
-    bs.reserve(maxSamples);
+    // Two scratch buckets reused across pixels to avoid alloc churn. We
+    // collect samples into BOTH on each pixel: one bucket holds samples
+    // from "high-quality" aligned frames (low reprojection error), the
+    // other holds ALL qualifying samples. After collection we pick the
+    // high-quality bucket when it has enough samples, otherwise fall back
+    // to all samples — this prevents the median from being contaminated by
+    // marginal-fit frames when we have plenty of sharper ones, while still
+    // recovering coverage on sparse captures.
+    std::vector<uchar> rsAll, gsAll, bsAll;
+    std::vector<uchar> rsHi, gsHi, bsHi;
+    const size_t numFrames = aligned.size();
+    rsAll.reserve(numFrames); gsAll.reserve(numFrames); bsAll.reserve(numFrames);
+    rsHi.reserve(numFrames);  gsHi.reserve(numFrames);  bsHi.reserve(numFrames);
+
+    // Per-frame "is high quality" flag, computed once outside the per-pixel
+    // loop. Threshold 0.6 corresponds to ~0.67 px mean reprojection error;
+    // matches the noise floor at the current detect scale.
+    constexpr float kHiQualityCutoff = 0.6f;
+    std::vector<uint8_t> isHiQuality(numFrames, 0);
+    for (size_t fi = 0; fi < numFrames; ++fi) {
+        isHiQuality[fi] = (aligned[fi].quality >= kHiQualityCutoff) ? 1 : 0;
+    }
+
+    // Row-pointer caches: one entry per aligned frame, refreshed per y.
+    // Eliminates ~24M bounds-checked .at<uchar>(y,x) calls per stitch on a
+    // 800K-pixel hole × 30 frames. nullptr in imgRows[fi] means that frame
+    // is invalid / skipped; person/valid rows can be nullptr if the
+    // corresponding mask was empty.
+    std::vector<const uchar*> imgRows(numFrames, nullptr);
+    std::vector<const uchar*> personRows(numFrames, nullptr);
+    std::vector<const uchar*> validRows(numFrames, nullptr);
 
     int totalHole = 0;
     int filled = 0;
@@ -63,26 +90,56 @@ StitchResult stitch(
         uchar*  unfilledRow  = result.stillUnfilled.ptr<uchar>(y);
         uchar*  countRow     = result.sampleCount.ptr<uchar>(y);
 
+        // Refresh per-frame row pointers for this y.
+        for (size_t fi = 0; fi < numFrames; ++fi) {
+            const auto& af = aligned[fi];
+            if (!af.valid || af.image.empty()) {
+                imgRows[fi] = nullptr;
+                continue;
+            }
+            imgRows[fi] = af.image.ptr<uchar>(y);
+            personRows[fi] = af.anyPersonMask.empty()
+                             ? nullptr : af.anyPersonMask.ptr<uchar>(y);
+            validRows[fi]  = af.validMask.empty()
+                             ? nullptr : af.validMask.ptr<uchar>(y);
+        }
+
         for (int x = 0; x < W; ++x) {
             if (holeRow[x] == 0) continue;          // outside the hole
             ++totalHole;
 
-            rs.clear(); gs.clear(); bs.clear();
+            rsAll.clear(); gsAll.clear(); bsAll.clear();
+            rsHi.clear();  gsHi.clear();  bsHi.clear();
 
-            for (const auto& af : aligned) {
-                if (!af.valid) continue;
+            for (size_t fi = 0; fi < numFrames; ++fi) {
+                const uchar* imgRow = imgRows[fi];
+                if (imgRow == nullptr) continue;    // frame invalid
                 // Skip frames where this same pixel was on a person (no usable bg).
-                if (!af.anyPersonMask.empty() &&
-                    af.anyPersonMask.at<uchar>(y, x) != 0) continue;
+                const uchar* pRow = personRows[fi];
+                if (pRow && pRow[x] != 0) continue;
                 // Skip pixels that the warp filled with black (out-of-frame).
-                if (!af.validMask.empty() &&
-                    af.validMask.at<uchar>(y, x) == 0) continue;
+                const uchar* vRow = validRows[fi];
+                if (vRow && vRow[x] == 0) continue;
 
-                const cv::Vec3b px = af.image.at<cv::Vec3b>(y, x);
-                rs.push_back(px[0]);
-                gs.push_back(px[1]);
-                bs.push_back(px[2]);
+                // CV_8UC3 row layout: 3 bytes/pixel, interleaved.
+                const uchar* px = imgRow + x * 3;
+                rsAll.push_back(px[0]); gsAll.push_back(px[1]); bsAll.push_back(px[2]);
+                if (isHiQuality[fi]) {
+                    rsHi.push_back(px[0]); gsHi.push_back(px[1]); bsHi.push_back(px[2]);
+                }
             }
+
+            // Prefer high-quality samples when at least 3 of them landed
+            // here; otherwise use everything to keep coverage on sparse
+            // captures. Both buckets are local references so downstream
+            // medianInPlace operates on the chosen vector in place.
+            constexpr int kHiPreferThreshold = 3;
+            std::vector<uchar>& rs =
+                    (rsHi.size() >= kHiPreferThreshold) ? rsHi : rsAll;
+            std::vector<uchar>& gs =
+                    (gsHi.size() >= kHiPreferThreshold) ? gsHi : gsAll;
+            std::vector<uchar>& bs =
+                    (bsHi.size() >= kHiPreferThreshold) ? bsHi : bsAll;
 
             const int n = static_cast<int>(rs.size());
             countRow[x] = static_cast<uchar>(std::min(n, 255));
@@ -133,9 +190,13 @@ StitchResult stitch(
     result.realFillRatio = (totalHole > 0)
                            ? static_cast<float>(filled) / totalHole
                            : 0.f;
+    result.noSampleRatio = (totalHole > 0)
+                           ? static_cast<float>(hist0) / totalHole
+                           : 0.f;
 
-    LOGI("stitch: holePx=%d filledWithRealBg=%d unfilled=%d ratio=%.2f",
-         totalHole, filled, totalHole - filled, result.realFillRatio);
+    LOGI("stitch: holePx=%d filledWithRealBg=%d unfilled=%d ratio=%.2f noSample=%.2f",
+         totalHole, filled, totalHole - filled,
+         result.realFillRatio, result.noSampleRatio);
     LOGI("stitch confidence: 0:%d  1-2:%d  3-9:%d  10+:%d",
          hist0, hist12, hist39, hist10p);
 
@@ -380,4 +441,74 @@ void matchNoiseToReferenceSurround(
     cv::Mat noisy8;
     noisy32.convertTo(noisy8, CV_8UC3);
     noisy8.copyTo(stitched, holeMask);
+}
+
+// ----------------------------------------------------------------------------
+// Multi-band (Laplacian pyramid) blend.
+// ----------------------------------------------------------------------------
+
+void multiBandBlendStitch(
+        cv::Mat& stitched,
+        const cv::Mat& reference,
+        const cv::Mat& holeMask) {
+    if (stitched.empty() || reference.empty() || holeMask.empty()) return;
+    if (stitched.size() != reference.size() ||
+        stitched.size() != holeMask.size()) return;
+    if (stitched.type() != CV_8UC3 || reference.type() != CV_8UC3) return;
+    if (holeMask.type() != CV_8UC1) return;
+
+    const int W = stitched.cols;
+    const int H = stitched.rows;
+
+    // num_bands picked so the smallest band still has > 16 px in both dims.
+    // Each pyramid level halves resolution; log2(minDim/16) is the upper
+    // bound. Clamped to [2, 5] — fewer than 2 defeats the purpose; more than
+    // 5 risks pyramid collapse on small inputs and inflates RAM.
+    const int minDim = std::min(W, H);
+    int numBands = static_cast<int>(std::floor(
+            std::log2(std::max(1.0, static_cast<double>(minDim) / 16.0))));
+    numBands = std::max(2, std::min(5, numBands));
+
+    // Bail when the hole touches the image border on both inner and outer
+    // mask boundaries — MultiBandBlender has been observed to produce
+    // smeared border pixels in that degenerate case. The legacy
+    // matchStitchToReferenceTint + featherStitchBoundary path is the
+    // fallback (caller decides).
+    cv::Mat refMask;
+    cv::bitwise_not(holeMask, refMask);
+    if (cv::countNonZero(refMask) < 200 || cv::countNonZero(holeMask) < 200) {
+        LOGI("multiBand: degenerate mask coverage, skipping");
+        return;
+    }
+
+    try {
+        cv::detail::MultiBandBlender blender(/*try_gpu=*/false, numBands);
+        cv::Rect roi(0, 0, W, H);
+        blender.prepare(roi);
+
+        cv::Mat ref16, stitched16;
+        reference.convertTo(ref16, CV_16SC3);
+        stitched.convertTo(stitched16, CV_16SC3);
+
+        blender.feed(ref16, refMask, cv::Point(0, 0));
+        blender.feed(stitched16, holeMask, cv::Point(0, 0));
+
+        cv::Mat resultS, resultMask;
+        blender.blend(resultS, resultMask);
+
+        // resultS is CV_16SC3; convert back. Saturating cast clamps the
+        // small overshoots that pyramid reconstruction can produce at
+        // sharp-edge pixels.
+        cv::Mat result8;
+        resultS.convertTo(result8, CV_8UC3);
+        result8.copyTo(stitched);
+
+        LOGI("multiBand: %d bands, %dx%d", numBands, W, H);
+    } catch (const cv::Exception& e) {
+        LOGI("multiBand: cv exception (%s); leaving stitched unchanged",
+             e.what());
+    } catch (const std::exception& e) {
+        LOGI("multiBand: std exception (%s); leaving stitched unchanged",
+             e.what());
+    }
 }

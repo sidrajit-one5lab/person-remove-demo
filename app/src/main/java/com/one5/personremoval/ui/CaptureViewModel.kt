@@ -42,7 +42,28 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     val tracker = Tracker()
     val nativeSession = NativeSession(capacity = 30)
     private val mlRepository = (application as PersonRemovalApp).mlRepository
+    // Optional alpha-matting refiner. Loads modnet.tflite if present;
+    // gracefully no-ops if the asset is missing.
+    private val mattingRefiner: com.one5.personremoval.ml.MattingRefiner =
+        com.one5.personremoval.ml.MattingRefiner(application)
+    // Gyroscope integrator: provides a per-frame device rotation matrix so
+    // the native aligner can fall back to a gyro-derived homography when
+    // ORB/AKAZE feature matching produces no inliers (texture-poor scenes:
+    // walls, sky, ceiling). No-ops on devices without a gyroscope.
+    private val gyroIntegrator: com.one5.personremoval.sensors.GyroIntegrator =
+        com.one5.personremoval.sensors.GyroIntegrator(application)
     private val captureUseCase = CaptureUseCase(nativeSession)
+
+    // Snapshot of the most recently pushed analyzer frame (RGBA layout, as
+    // delivered by CameraX). Used as the reference image for matting
+    // refinement at capture time. Updated by the analyzer coroutine, read
+    // by the capture coroutine — Volatile is sufficient because the writer
+    // is single-threaded and the reader tolerates one frame of staleness
+    // (the native ring buffer's reference is at most one frame ahead, well
+    // within matting's bbox-padding slack).
+    @Volatile private var latestRgba: ByteArray? = null
+    @Volatile private var latestRgbaW: Int = 0
+    @Volatile private var latestRgbaH: Int = 0
 
     private val _hasPermission = MutableStateFlow(false)
     val hasPermission: StateFlow<Boolean> = _hasPermission.asStateFlow()
@@ -75,6 +96,22 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             captureUseCase.lamaInpainter = mlRepository.lama()
         }
+        captureUseCase.mattingRefiner = mattingRefiner
+        // Start gyro accumulation. The rotation matrix resets here so all
+        // subsequent buffer frames are expressed in a common reference
+        // frame (the moment the VM was constructed).
+        gyroIntegrator.start()
+
+        // After CameraManager applies AE/AWB lock, flush the ring buffer.
+        // Pre-lock frames captured varying exposure/WB; mixing them into the
+        // temporal-median stitch shifts the patched region's tint away from
+        // the post-lock reference frame, producing the visible "bright box"
+        // halo on multi-region holes. Discarding pre-lock frames means only
+        // exposure-consistent frames feed the stitcher.
+        cameraManager.onExposureLocked = {
+            nativeSession.clearBuffer()
+            _bufSize.value = 0
+        }
 
         viewModelScope.launch(Dispatchers.Default) {
             cameraManager.frames.collectLatest { proxy ->
@@ -101,7 +138,16 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     val (tracked, states) = tracker.update(raw.persons, nowMs)
 
                     val masks: Array<ByteArray> = Array(tracked.size) { i -> tracked[i].mask }
-                    nativeSession.pushFrame(rgba, w, h, masks, nowMs)
+                    val rot = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
+                    nativeSession.pushFrame(rgba, w, h, masks, nowMs, rot)
+
+                    // Snapshot for matting refinement at capture time. The
+                    // ByteArray is owned by this loop iteration; reassigning
+                    // the @Volatile reference is the publish step. The
+                    // capture coroutine reads atomically.
+                    latestRgba = rgba
+                    latestRgbaW = w
+                    latestRgbaH = h
 
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
@@ -179,7 +225,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 val d = _detection.value
                 val states = tracker.getStates()
                 val (result, status) = if (d != null) {
-                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight)
+                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight,
+                            referenceRgba = latestRgba)
                 } else {
                     null to "no detection yet"
                 }
@@ -204,7 +251,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 val d = _detection.value
                 val states = tracker.getStates()
                 val (result, status) = if (d != null) {
-                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight)
+                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight,
+                            referenceRgba = latestRgba)
                 } else {
                     null to "no detection yet"
                 }
@@ -264,8 +312,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
     override fun onCleared() {
         super.onCleared()
+        gyroIntegrator.stop()
         cameraManager.shutdown()
         segmenter.close()
+        mattingRefiner.close()
         nativeSession.close()
     }
 }

@@ -15,7 +15,11 @@ struct AlignedFrame {
     std::vector<cv::Mat> personMasks;       // each warped to reference space
     cv::Mat anyPersonMask;                  // union, warped (already dilated)
     cv::Mat validMask;                      // 255 where pixel is real, 0 where warp put black
-    bool valid = false;
+    bool   valid   = false;
+    // Quality ∈ (0, 1]. 1 / (1 + meanReprojError). Higher = sharper H fit.
+    // Stitcher uses this to prefer high-quality samples when many candidates
+    // are available, avoiding contamination of the median by marginal fits.
+    float  quality = 0.f;
 };
 
 /**

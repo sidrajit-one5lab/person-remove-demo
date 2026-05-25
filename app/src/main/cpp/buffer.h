@@ -19,6 +19,12 @@ struct BufferedFrame {
     cv::Mat anyPersonMask;
     cv::Mat thumbnail;       // 32x24 grayscale, for diversity-based eviction
     int64_t timestampMs = 0;
+    // Device rotation (3x3 row-major, CV_64FC1) captured at the moment
+    // this frame was pushed, relative to whatever the gyro integrator was
+    // started at. Empty when gyroscope was unavailable or the caller
+    // didn't pass it. Used by the aligner as a fallback when feature
+    // matching produces no inliers (texture-poor scenes).
+    cv::Mat rotation;
 };
 
 /**
