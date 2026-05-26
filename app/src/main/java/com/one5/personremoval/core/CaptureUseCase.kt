@@ -78,43 +78,31 @@ class CaptureUseCase(
         val removeMask = if (canMatte) {
             val rgb = rgbaToRgb(referenceRgba!!, w, h)
             val alpha = refiner!!.refineRemoveMask(rgb, w, h, removePersons)
-            // Threshold at 0.5 alpha so only confidently-foreground pixels
-            // become the REMOVE hole. Sub-threshold alphas live in YOLO's
-            // dilation slack on the JNI side. Downstream native code
-            // binarizes anything non-zero, so we map [128..255] → 1.
             val out = ByteArray(w * h)
             for (i in 0 until w * h) {
                 if ((alpha[i].toInt() and 0xFF) >= 128) out[i] = 1
             }
+            applyBboxFloor(out, removePersons, w, h)
             out
         } else {
             buildBinaryRemoveMaskWithBboxFloor(removePersons, w, h)
         }
 
-        val t0 = System.currentTimeMillis()
-        val stitch = nativeSession.stitchForInpaint(removeMask, w, h)
-            ?: return null to "no stitch (empty buffer or stale detection)"
+        val removeTrackIds = removePersons.map { it.trackId }.toIntArray()
 
-        // Inpaint routing:
-        //   - fill ≥ 0.95          → no inpaint needed.
-        //   - fill ≥ 0.85          → OpenCV (Navier-Stokes). Small gaps; LaMa
-        //                            adds no quality at this hole size.
-        //   - noSampleRatio > 0.60 → LaMa would be pure hallucination (no
-        //                            real context band for the model to
-        //                            extrapolate from). Use Navier-Stokes
-        //                            instead — smoother, less surprising.
-        //   - otherwise            → LaMa. Big-enough holes with enough
-        //                            context band that LaMa beats classical
-        //                            inpaint on plausibility.
-        //
-        // The 0.85 threshold + LaMa FP16 brings worst-case inpaint into the
-        // ~10-15s range (FP32 was 22-32s). Re-enabled now that FP16 path
-        // exists.
-        val noInpaintThreshold = 0.95f
+        val t0 = System.currentTimeMillis()
+        val stitch = nativeSession.stitchForInpaint(removeMask, w, h, removeTrackIds)
+            ?: return null to "keep phone steady — hold still and ask the subject to step aside"
+
+        // Recompute fill ratio using actual unfilled mask (ghost detector may
+        // have flagged additional pixels after native fillRatio was computed).
+        val actualUnfilled = stitch.unfilledMask.count { it.toInt() != 0 }
+        val holePx = stitch.fullHoleMask.count { it.toInt() != 0 }.coerceAtLeast(1)
+        val actualFill = 1f - actualUnfilled.toFloat() / holePx
+
         val classicalThreshold = 0.85f
-        val needsInpaint = stitch.fillRatio < noInpaintThreshold
-        val lamaHasNoContext = stitch.noSampleRatio > 0.60f
-        val useLama = stitch.fillRatio < classicalThreshold && !lamaHasNoContext
+        val needsInpaint = actualUnfilled > 0
+        val useLama = actualFill < classicalThreshold
 
         val filledRgb: ByteArray
         val inpaintMethod: String
@@ -124,11 +112,7 @@ class CaptureUseCase(
         } else if (!useLama) {
             val cv = nativeSession.opencvInpaint(stitch.rgb, stitch.unfilledMask, stitch.width, stitch.height)
             filledRgb = cv ?: stitch.rgb
-            inpaintMethod = when {
-                cv == null -> "none-failed"
-                lamaHasNoContext -> "opencv-ns-noctx"
-                else -> "opencv-ns-fast"
-            }
+            inpaintMethod = if (cv == null) "none-failed" else "opencv-ns-fast"
         } else {
             var ok: ByteArray? = null
             var method = "opencv"
@@ -149,6 +133,10 @@ class CaptureUseCase(
             inpaintMethod = if (ok == null) "none-failed" else method
         }
 
+        if (useLama) {
+            harmonizeLamaRegion(filledRgb, stitch.unfilledMask, stitch.width, stitch.height)
+        }
+
         val polished = nativeSession.finalize(
             stitch.rgb, filledRgb, stitch.unfilledMask,
             stitch.width, stitch.height
@@ -167,7 +155,9 @@ class CaptureUseCase(
         // the user must move the subject (or shift the camera) before retake.
         // Fall back to the older fill-based hint for borderline captures.
         val status = when {
-            stitch.noSampleRatio > 0.30f ->
+            stitch.fillRatio < 0.25f ->
+                "$baseStatus  — keep phone steady and ask subject to step aside"
+            stitch.noSampleRatio >= 0.30f ->
                 "$baseStatus  — large area never visible; ask subject to step aside briefly and retake"
             stitch.fillRatio < 0.50f ->
                 "$baseStatus  — tricky scene, try stepping out of frame for a few seconds and retake"
@@ -179,6 +169,23 @@ class CaptureUseCase(
             height = stitch.height,
             holeMask = stitch.fullHoleMask
         ) to status
+    }
+
+    private fun applyBboxFloor(mask: ByteArray, persons: List<Person>, w: Int, h: Int) {
+        val threshold = (w.toLong() * h * 0.25).toInt()
+        for (p in persons) {
+            val xMin = p.bBox.left.toInt().coerceAtLeast(0)
+            val yMin = p.bBox.top.toInt().coerceAtLeast(0)
+            val xMax = p.bBox.right.toInt().coerceAtMost(w - 1)
+            val yMax = p.bBox.bottom.toInt().coerceAtMost(h - 1)
+            val area = (xMax - xMin + 1) * (yMax - yMin + 1)
+            if (area > threshold) {
+                for (y in yMin..yMax) {
+                    val row = y * w
+                    for (x in xMin..xMax) mask[row + x] = 1
+                }
+            }
+        }
     }
 
     private fun buildBinaryRemoveMaskWithBboxFloor(
@@ -210,6 +217,69 @@ class CaptureUseCase(
             }
         }
         return removeMask
+    }
+
+    /**
+     * Shift the LaMa-filled region's mean R/G/B to match a band of real
+     * pixels just outside the unfilled mask. Fixes the washed-out / hazy
+     * brightness that LaMa produces when hallucinating large areas.
+     * Operates in-place on [rgb].
+     */
+    private fun harmonizeLamaRegion(rgb: ByteArray, mask: ByteArray, w: Int, h: Int) {
+        val n = w * h
+        if (rgb.size < n * 3 || mask.size < n) return
+
+        val bandPx = 20
+        var outerR = 0L; var outerG = 0L; var outerB = 0L; var outerN = 0
+        var innerR = 0L; var innerG = 0L; var innerB = 0L; var innerN = 0
+
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val i = y * w + x
+                val isMask = mask[i].toInt() != 0
+                if (isMask) {
+                    innerR += rgb[i * 3].toInt() and 0xFF
+                    innerG += rgb[i * 3 + 1].toInt() and 0xFF
+                    innerB += rgb[i * 3 + 2].toInt() and 0xFF
+                    innerN++
+                } else {
+                    val nearMask = (x > 0 && mask[i - 1].toInt() != 0) ||
+                            (x < w - 1 && mask[i + 1].toInt() != 0) ||
+                            (y > 0 && mask[i - w].toInt() != 0) ||
+                            (y < h - 1 && mask[i + w].toInt() != 0)
+                    if (!nearMask) continue
+                    val yLo = maxOf(0, y - bandPx); val yHi = minOf(h - 1, y + bandPx)
+                    val xLo = maxOf(0, x - bandPx); val xHi = minOf(w - 1, x + bandPx)
+                    var inBand = false
+                    bandCheck@ for (by in yLo..yHi step 4) {
+                        for (bx in xLo..xHi step 4) {
+                            if (mask[by * w + bx].toInt() != 0) { inBand = true; break@bandCheck }
+                        }
+                    }
+                    if (inBand) {
+                        outerR += rgb[i * 3].toInt() and 0xFF
+                        outerG += rgb[i * 3 + 1].toInt() and 0xFF
+                        outerB += rgb[i * 3 + 2].toInt() and 0xFF
+                        outerN++
+                    }
+                }
+            }
+        }
+
+        if (outerN < 500 || innerN < 200) return
+        val dr = (outerR.toFloat() / outerN - innerR.toFloat() / innerN).toInt().coerceIn(-15, 15)
+        val dg = (outerG.toFloat() / outerN - innerG.toFloat() / innerN).toInt().coerceIn(-15, 15)
+        val db = (outerB.toFloat() / outerN - innerB.toFloat() / innerN).toInt().coerceIn(-15, 15)
+
+        if (dr == 0 && dg == 0 && db == 0) return
+        Log.i(TAG, "harmonize: shift R=$dr G=$dg B=$db (outer=$outerN inner=$innerN)")
+
+        for (i in 0 until n) {
+            if (mask[i].toInt() == 0) continue
+            rgb[i * 3]     = ((rgb[i * 3].toInt() and 0xFF) + dr).coerceIn(0, 255).toByte()
+            rgb[i * 3 + 1] = ((rgb[i * 3 + 1].toInt() and 0xFF) + dg).coerceIn(0, 255).toByte()
+            rgb[i * 3 + 2] = ((rgb[i * 3 + 2].toInt() and 0xFF) + db).coerceIn(0, 255).toByte()
+        }
     }
 
     private fun rgbaToRgb(rgba: ByteArray, w: Int, h: Int): ByteArray {

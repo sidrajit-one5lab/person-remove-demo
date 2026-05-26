@@ -30,6 +30,7 @@ fun MaskOverlay(
     states: Map<Int, PersonState>,
     frameW: Int,
     frameH: Int,
+    isFrontCamera: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Canvas(modifier) {
@@ -38,7 +39,11 @@ fun MaskOverlay(
         val sy = size.height / frameH.toFloat()
 
         for (p in persons) {
-            val left = p.bBox.left * sx
+            val left = if (isFrontCamera) {
+                (frameW - p.bBox.right) * sx
+            } else {
+                p.bBox.left * sx
+            }
             val top = p.bBox.top * sy
             val w = (p.bBox.right - p.bBox.left) * sx
             val h = (p.bBox.bottom - p.bBox.top) * sy

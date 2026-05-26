@@ -85,10 +85,10 @@ StitchResult stitch(
     int hist0 = 0, hist12 = 0, hist39 = 0, hist10p = 0;
 
     for (int y = 0; y < H; ++y) {
-        const uchar* holeRow = holeMask.ptr<uchar>(y);
-        cv::Vec3b*    outRow = result.image.ptr<cv::Vec3b>(y);
-        uchar*  unfilledRow  = result.stillUnfilled.ptr<uchar>(y);
-        uchar*  countRow     = result.sampleCount.ptr<uchar>(y);
+        const auto* holeRow = holeMask.ptr<uchar>(y);
+        auto*    outRow = result.image.ptr<cv::Vec3b>(y);
+        auto*  unfilledRow  = result.stillUnfilled.ptr<uchar>(y);
+        auto*  countRow     = result.sampleCount.ptr<uchar>(y);
 
         // Refresh per-frame row pointers for this y.
         for (size_t fi = 0; fi < numFrames; ++fi) {
@@ -441,6 +441,52 @@ void matchNoiseToReferenceSurround(
     cv::Mat noisy8;
     noisy32.convertTo(noisy8, CV_8UC3);
     noisy8.copyTo(stitched, holeMask);
+}
+
+// ----------------------------------------------------------------------------
+// Post-stitch ghost detector.
+// ----------------------------------------------------------------------------
+
+void detectGhostPixels(
+        const cv::Mat& stitched,
+        const cv::Mat& holeMask,
+        cv::Mat& unfilled,
+        const cv::Mat& sampleCount) {
+    if (stitched.empty() || holeMask.empty() || unfilled.empty()) return;
+
+    cv::Mat kern = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(33, 33));
+    cv::Mat dilated, outerRing;
+    cv::dilate(holeMask, dilated, kern);
+    cv::subtract(dilated, holeMask, outerRing);
+    if (cv::countNonZero(outerRing) < 200) return;
+
+    cv::Mat gray;
+    cv::cvtColor(stitched, gray, cv::COLOR_RGB2GRAY);
+    cv::Scalar bandMean, bandStddev;
+    cv::meanStdDev(gray, bandMean, bandStddev, outerRing);
+
+    const auto refMean = static_cast<float>(bandMean[0]);
+    const auto refStd  = static_cast<float>(bandStddev[0]);
+    const float limit   = std::max(50.0f, refStd * 3.0f);
+
+    int flagged = 0;
+    const int H = gray.rows, W = gray.cols;
+    for (int y = 0; y < H; ++y) {
+        const uchar* gRow = gray.ptr<uchar>(y);
+        const auto* hRow = holeMask.ptr<uchar>(y);
+        auto*       uRow = unfilled.ptr<uchar>(y);
+        for (int x = 0; x < W; ++x) {
+            if (hRow[x] == 0) continue;
+            if (uRow[x] != 0) continue;
+            float diff = std::abs(static_cast<float>(gRow[x]) - refMean);
+            if (diff > limit) {
+                uRow[x] = 255;
+                ++flagged;
+            }
+        }
+    }
+    LOGI("ghostDetect: flagged %d pixels (refMean=%.0f refStd=%.1f limit=%.1f)",
+         flagged, refMean, refStd, limit);
 }
 
 // ----------------------------------------------------------------------------

@@ -61,7 +61,7 @@ class LamaInpainter(
         private const val LARGE_CROP_THRESHOLD = 768
         // Fraction of each tile that overlaps with its neighbor. The
         // overlap region carries the feather-blended seam.
-        private const val TILE_OVERLAP_FRAC = 0.25f
+        private const val TILE_OVERLAP_FRAC = 0.40f
     }
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
@@ -384,11 +384,13 @@ class LamaInpainter(
         val result = rgb.copyOf()
 
         for ((idx, comp) in components.withIndex()) {
-            // Expand bbox with padding, clamp to image bounds.
-            val x0 = (comp.left - paddingPx).coerceAtLeast(0)
-            val y0 = (comp.top - paddingPx).coerceAtLeast(0)
-            val x1 = (comp.right + paddingPx).coerceAtMost(width)
-            val y1 = (comp.bottom + paddingPx).coerceAtMost(height)
+            val compW = comp.right - comp.left
+            val compH = comp.bottom - comp.top
+            val pad = maxOf(paddingPx, compW / 3, compH / 3)
+            val x0 = (comp.left - pad).coerceAtLeast(0)
+            val y0 = (comp.top - pad).coerceAtLeast(0)
+            val x1 = (comp.right + pad).coerceAtMost(width)
+            val y1 = (comp.bottom + pad).coerceAtMost(height)
             val cw = x1 - x0
             val ch = y1 - y0
             if (cw <= 0 || ch <= 0) continue
@@ -428,9 +430,6 @@ class LamaInpainter(
                 inpaint(cropRgb, cropMask, cw, ch)
             }
 
-            // Composite ONLY where the original (uncropped) mask was non-zero.
-            // Pixels in the crop padding region keep the original — they were
-            // never gaps, they were just context for LaMa.
             for (y in 0 until ch) {
                 val srcRow = y * cw
                 val dstRow = (y0 + y) * width

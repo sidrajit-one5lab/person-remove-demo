@@ -40,7 +40,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     val cameraManager = CameraManager(application)
     private val segmenter = YoloSegmenter(application)
     val tracker = Tracker()
-    val nativeSession = NativeSession(capacity = 30)
+    val nativeSession = NativeSession(capacity = 45)
     private val mlRepository = (application as PersonRemovalApp).mlRepository
     // Optional alpha-matting refiner. Loads modnet.tflite if present;
     // gracefully no-ops if the asset is missing.
@@ -64,6 +64,15 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     @Volatile private var latestRgba: ByteArray? = null
     @Volatile private var latestRgbaW: Int = 0
     @Volatile private var latestRgbaH: Int = 0
+
+    // AE re-lock on large camera motion. When the user physically moves
+    // (walks to different position), exposure/WB lock becomes stale. Track
+    // the gyro rotation at lock time; if angular displacement exceeds the
+    // threshold, trigger relockExposure() so AE reconverges for the new
+    // viewpoint. The onExposureLocked callback flushes the buffer, so only
+    // exposure-consistent frames from the new position enter the stitch.
+    @Volatile private var lockedRotation: FloatArray? = null
+    @Volatile private var lastRelockMs: Long = 0L
 
     private val _hasPermission = MutableStateFlow(false)
     val hasPermission: StateFlow<Boolean> = _hasPermission.asStateFlow()
@@ -111,11 +120,16 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         cameraManager.onExposureLocked = {
             nativeSession.clearBuffer()
             _bufSize.value = 0
+            lockedRotation = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
+            lastRelockMs = System.currentTimeMillis()
         }
 
         viewModelScope.launch(Dispatchers.Default) {
             cameraManager.frames.collectLatest { proxy ->
                 try {
+                    if (_isProcessing.value) {
+                        return@collectLatest
+                    }
                     val w = proxy.width
                     val h = proxy.height
                     val plane = proxy.planes[0]
@@ -138,8 +152,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     val (tracked, states) = tracker.update(raw.persons, nowMs)
 
                     val masks: Array<ByteArray> = Array(tracked.size) { i -> tracked[i].mask }
+                    val trackIds = IntArray(tracked.size) { i -> tracked[i].trackId }
                     val rot = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
-                    nativeSession.pushFrame(rgba, w, h, masks, nowMs, rot)
+                    nativeSession.pushFrame(rgba, w, h, masks, nowMs, rot, trackIds)
 
                     // Snapshot for matting refinement at capture time. The
                     // ByteArray is owned by this loop iteration; reassigning
@@ -152,6 +167,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
                     _personStates.value = states
+                    checkMotionRelock(rot)
                 } finally {
                     proxy.close()
                 }
@@ -189,7 +205,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
         val sx = d.sourceWidth.toFloat() / canvasWidth
         val sy = d.sourceHeight.toFloat() / canvasHeight
-        val fx = (offsetX * sx).toInt().coerceIn(0, d.sourceWidth - 1)
+        val isFront = _cameraSelector.value == CameraSelector.DEFAULT_FRONT_CAMERA
+        val rawX = (offsetX * sx).toInt().coerceIn(0, d.sourceWidth - 1)
+        val fx = if (isFront) d.sourceWidth - 1 - rawX else rawX
         val fy = (offsetY * sy).toInt().coerceIn(0, d.sourceHeight - 1)
         val idx = fy * d.sourceWidth + fx
 
@@ -243,6 +261,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     fun onCapture() {
         if (_isProcessing.value) return
         _isProcessing.value = true
+        nativeSession.frozen = true
         viewModelScope.launch(Dispatchers.Default) {
             try {
                 delay(1500L)
@@ -296,17 +315,33 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
 
                 val isTricky = "tricky scene" in finalStatus
+                val keepSteady = "keep phone steady" in finalStatus
                 val toastMsg = when {
                     uri == null -> "Save failed"
+                    keepSteady -> "Saved — keep phone steady, ask subject to step aside"
                     isTricky -> "Saved — tricky scene, try stepping out of frame and retake"
                     else -> "Saved to Gallery"
                 }
                 _stitchPreview.value = bmp
                 _lastResultText.value = finalStatus
-                _toastEvents.tryEmit(ToastEvent(toastMsg, long = isTricky))
+                _toastEvents.tryEmit(ToastEvent(toastMsg, long = isTricky || keepSteady))
             } finally {
+                nativeSession.frozen = false
                 _isProcessing.value = false
             }
+        }
+    }
+
+    private fun checkMotionRelock(currentRotation: FloatArray?) {
+        if (nativeSession.frozen) return
+        val locked = lockedRotation ?: return
+        val current = currentRotation ?: return
+        val nowMs = System.currentTimeMillis()
+        if (nowMs - lastRelockMs < 3000L) return
+        val angle = angularDisplacement(locked, current)
+        if (angle > RELOCK_ANGLE_DEG) {
+            lastRelockMs = nowMs
+            cameraManager.relockExposure()
         }
     }
 
@@ -318,6 +353,16 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         mattingRefiner.close()
         nativeSession.close()
     }
+}
+
+private const val RELOCK_ANGLE_DEG = 30f
+
+private fun angularDisplacement(r1: FloatArray, r2: FloatArray): Float {
+    // trace(R2 * R1^T) = Frobenius inner product of R1 and R2
+    var trace = 0f
+    for (i in 0 until 9) trace += r1[i] * r2[i]
+    val cosAngle = ((trace - 1f) / 2f).coerceIn(-1f, 1f)
+    return Math.toDegrees(kotlin.math.acos(cosAngle.toDouble())).toFloat()
 }
 
 private fun rgbBytesToBitmap(rgb: ByteArray, w: Int, h: Int): Bitmap {

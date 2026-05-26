@@ -151,6 +151,17 @@ void matchNoiseToReferenceSurround(
         int bandPx = 10);
 
 /**
+ * Post-stitch ghost detector. Compares luminance of filled pixels inside the
+ * hole against the reference band just outside. Pixels that deviate
+ * significantly are flagged as unfilled so LaMa/NS replaces them.
+ */
+void detectGhostPixels(
+        const cv::Mat& stitched,
+        const cv::Mat& holeMask,
+        cv::Mat& unfilled,
+        const cv::Mat& sampleCount);
+
+/**
  * Temporal-median stitcher.
  *
  * For each pixel inside [holeMask]:

@@ -144,7 +144,7 @@ class CameraManager(private val context: Context) {
             // ORB still operates on ~270-wide gray; no retuning needed.
             val resolutionSelector = ResolutionSelector.Builder()
                 .setResolutionStrategy(
-                    ResolutionStrategy(Size(1080, 1920), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
+                    ResolutionStrategy(Size(900, 1200), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
                 )
                 .build()
 

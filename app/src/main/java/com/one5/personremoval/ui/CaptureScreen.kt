@@ -103,6 +103,7 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
                 states = personStates,
                 frameW = d.sourceWidth,
                 frameH = d.sourceHeight,
+                isFrontCamera = cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA,
                 modifier = Modifier.fillMaxSize()
             )
         }
@@ -112,7 +113,7 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
             val cam = if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "back"
             Text(
                 text = "$cam   persons: ${d.persons.size}   remove: $removeCount   " +
-                        "${d.inferenceMs} ms   buf: $bufSize/30",
+                        "${d.inferenceMs} ms   buf: $bufSize/45",
                 color = Color.White,
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -153,12 +154,12 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
                 .padding(horizontal = 16.dp, vertical = 32.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            Button(
-                enabled = !isProcessing,
-                onClick = { viewModel.onTestStitch() }
-            ) {
-                Text("Test Stitch")
-            }
+//            Button(
+//                enabled = !isProcessing,
+//                onClick = { viewModel.onTestStitch() }
+//            ) {
+//                Text("Test Stitch")
+//            }
             Button(
                 enabled = !isProcessing,
                 onClick = { viewModel.onCapture() }

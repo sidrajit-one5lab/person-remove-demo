@@ -16,6 +16,7 @@
 struct BufferedFrame {
     cv::Mat image;
     std::vector<cv::Mat> personMasks;
+    std::vector<int> personTrackIds;   // parallel to personMasks; tracker-assigned stable ID per person
     cv::Mat anyPersonMask;
     cv::Mat thumbnail;       // 32x24 grayscale, for diversity-based eviction
     int64_t timestampMs = 0;

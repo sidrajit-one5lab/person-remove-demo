@@ -37,7 +37,7 @@ class YoloSegmenter(
     // workbench, etc.). The COCO `person` class has very low false-positive
     // density above ~0.25, so the cost is just a few stray chair/mannequin
     // boxes that the user can ignore.
-    private val confidenceThreshold: Float = 0.3f,
+    private val confidenceThreshold: Float = 0.25f,
     private val iouThreshold: Float = 0.5f,
     private val personClassIndex: Int = 0
 ) : AutoCloseable {
@@ -61,7 +61,7 @@ class YoloSegmenter(
         // Adaptive threshold range: low-confidence detections (0.3) → 0.20
         // (aggressive, catches soft edges), high-confidence (0.9) → 0.38
         // (tight, less background puff).
-        private const val MASK_THRESH_MIN = 0.20f
+        private const val MASK_THRESH_MIN = 0.15f
         private const val MASK_THRESH_MAX = 0.40f
     }
 
@@ -348,7 +348,7 @@ class YoloSegmenter(
             val outRow = y * srcW
             for (x in ix1..ix2) {
                 val px = ((x * scale + padX) * protoScale).toInt().coerceIn(0, MASK_PROTO_SIZE - 1)
-                val maskThreshold = MASK_THRESH_MIN + (MASK_THRESH_MAX - MASK_THRESH_MIN) * confidence
+                val maskThreshold = MASK_THRESH_MIN
                 if (protoMask[rowBase + px] > maskThreshold) {
                     out[outRow + x] = 1
                 }

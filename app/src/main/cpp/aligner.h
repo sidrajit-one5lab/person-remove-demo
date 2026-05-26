@@ -13,6 +13,7 @@
 struct AlignedFrame {
     cv::Mat image;                          // warped RGB, same size as reference
     std::vector<cv::Mat> personMasks;       // each warped to reference space
+    std::vector<int> personTrackIds;        // parallel to personMasks; carried from BufferedFrame
     cv::Mat anyPersonMask;                  // union, warped (already dilated)
     cv::Mat validMask;                      // 255 where pixel is real, 0 where warp put black
     bool   valid   = false;

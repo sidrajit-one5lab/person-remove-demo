@@ -15,6 +15,7 @@
 #include <chrono>
 #include <algorithm>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 #include "buffer.h"
 #include "aligner.h"
@@ -48,6 +49,11 @@ struct Session {
     // "static" and the buffer never collects clean-background samples for
     // the eventual capture.
     int64_t lastPushMs = 0;
+    // Detection-miss guard: fraction of pixels that were person in the last
+    // pushed frame. If previous frame had significant person coverage but
+    // current frame has zero AND the scene didn't change (low thumbnail diff),
+    // YOLO likely missed detection → skip frame to prevent ghost silhouettes.
+    float lastPersonCoverage = 0.f;
 };
 
 Session* asSession(jlong h) { return reinterpret_cast<Session*>(h); }
@@ -118,7 +124,8 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
         jbyteArray rgba, jint width, jint height,
         jobjectArray personMasks,
         jlong timestampMs,
-        jfloatArray rotation9) {
+        jfloatArray rotation9,
+        jintArray trackIds) {
 
     auto* s = asSession(handle);
     if (!s) {
@@ -177,6 +184,44 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
             env->ReleaseByteArrayElements(arr, mp, JNI_ABORT);
             env->DeleteLocalRef(arr);
         }
+    }
+
+    // Store per-person track IDs (parallel to personMasks) so the stitcher
+    // can distinguish REMOVE vs KEEP persons at capture time.
+    if (trackIds != nullptr) {
+        jsize idCount = env->GetArrayLength(trackIds);
+        jint* idPtr = env->GetIntArrayElements(trackIds, nullptr);
+        if (idPtr) {
+            f.personTrackIds.reserve(idCount);
+            for (jsize i = 0; i < idCount; ++i) {
+                f.personTrackIds.push_back(idPtr[i]);
+            }
+            env->ReleaseIntArrayElements(trackIds, idPtr, JNI_ABORT);
+        }
+    }
+
+    // Detection-miss guard: if the previous pushed frame had significant
+    // person coverage but this frame has zero, AND the scene hasn't changed
+    // much (person is still in view but YOLO missed), skip the frame.
+    // Without this, unmasked person pixels enter the median → ghost.
+    {
+        const int totalPx = width * height;
+        const int personPx = cv::countNonZero(f.anyPersonMask);
+        const float coverage = (totalPx > 0) ? static_cast<float>(personPx) / totalPx : 0.f;
+        if (s->lastPersonCoverage > 0.02f && coverage < 0.001f && !s->lastThumb.empty()) {
+            cv::Mat gray, thumb;
+            cv::cvtColor(f.image, gray, cv::COLOR_RGB2GRAY);
+            cv::resize(gray, thumb, cv::Size(32, 24), 0, 0, cv::INTER_AREA);
+            cv::Mat diff;
+            cv::absdiff(thumb, s->lastThumb, diff);
+            if (cv::mean(diff)[0] < 15.0) {
+                LOGI("pushFrame: detection miss guard — prev coverage %.1f%% "
+                     "but current 0%%, scene unchanged, skipping",
+                     s->lastPersonCoverage * 100);
+                return;
+            }
+        }
+        s->lastPersonCoverage = coverage;
     }
 
     // Static-scene skip + heartbeat: compare a 32×24 grayscale thumbnail of
@@ -348,6 +393,7 @@ namespace {
  */
 bool runStitchForInpaint(Session* s, JNIEnv* env,
                          jbyteArray jRemoveMask, jint maskW, jint maskH,
+                         jintArray jRemoveTrackIds,
                          jobjectArray outArr) {
     auto snap = s->buffer->snapshot();
     if (snap.empty()) {
@@ -381,11 +427,41 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         return false;
     }
 
-    // No pre-trim: let the aligner decide per-frame via translation/reproj
-    // gates. Old frames from when the person wasn't in frame are the most
-    // valuable — they have clean background. Trimming them defeats the purpose
-    // for "hold steady → step out → step back → capture" workflows.
-    LOGI("stitchForInpaint: using all %zu candidate frames", snap.size());
+    // Viewpoint coherence pre-filter: discard frames where the CAMERA
+    // moved significantly (walk-away scenario). Uses gyro rotation to
+    // distinguish camera motion from scene-content change (person stepping
+    // aside). A large thumbnail diff with SMALL gyro displacement means
+    // the person moved, not the camera — those frames are valuable and
+    // must be kept. Only discard when both thumbnail AND gyro confirm
+    // the camera itself moved to a very different position.
+    {
+        size_t before = snap.size();
+        const bool refHasRot = !reference.rotation.empty();
+        cv::Mat refThumb;
+        {
+            cv::Mat refGray;
+            cv::cvtColor(reference.image, refGray, cv::COLOR_RGB2GRAY);
+            cv::resize(refGray, refThumb, cv::Size(32, 24), 0, 0, cv::INTER_AREA);
+        }
+        snap.erase(
+            std::remove_if(snap.begin(), snap.end(),
+                [&reference, refHasRot, &refThumb](const BufferedFrame& f) {
+                    if (refHasRot && !f.rotation.empty()) {
+                        cv::Mat Rrel = reference.rotation.t() * f.rotation;
+                        double tr = cv::trace(Rrel)[0];
+                        double cosAngle = std::max(-1.0, std::min(1.0, (tr - 1.0) / 2.0));
+                        double angleDeg = std::acos(cosAngle) * 180.0 / CV_PI;
+                        return angleDeg > 25.0;
+                    }
+                    if (f.thumbnail.empty()) return false;
+                    cv::Mat diff;
+                    cv::absdiff(f.thumbnail, refThumb, diff);
+                    return cv::mean(diff)[0] > 40.0;
+                }),
+            snap.end());
+        LOGI("stitchForInpaint: viewpoint filter kept %zu/%zu frames",
+             snap.size(), before);
+    }
 
     // Two-stage dilation:
     // 1. Uniform 30px elliptical dilation (silhouette undercoverage: hair, jaw, hands)
@@ -404,11 +480,70 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         cv::dilate(dilatedHole, dilatedHole, shadowKern);
     }
 
+    // Parse REMOVE track IDs so we can rebuild per-frame person masks to
+    // exclude only REMOVE persons. KEEP persons become valid background.
+    std::unordered_set<int> removeIds;
+    if (jRemoveTrackIds != nullptr) {
+        jsize idCount = env->GetArrayLength(jRemoveTrackIds);
+        jint* idPtr = env->GetIntArrayElements(jRemoveTrackIds, nullptr);
+        if (idPtr) {
+            for (jsize i = 0; i < idCount; ++i) removeIds.insert(idPtr[i]);
+            env->ReleaseIntArrayElements(jRemoveTrackIds, idPtr, JNI_ABORT);
+        }
+    }
+
+    // Early-abort: if the buffer contains frames with very large camera
+    // rotation relative to the reference (user walking with phone), abort
+    // before the expensive alignment pass. Uses gyro rotation matrices
+    // which are already stored per frame — zero compute cost.
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
+    if (!reference.rotation.empty()) {
+        int largeMotion = 0;
+        for (const auto& f : snap) {
+            if (f.rotation.empty()) continue;
+            cv::Mat Rrel = reference.rotation.t() * f.rotation;
+            double tr = cv::trace(Rrel)[0];
+            double cosA = std::max(-1.0, std::min(1.0, (tr - 1.0) / 2.0));
+            double deg = std::acos(cosA) * 180.0 / CV_PI;
+            if (deg > 20.0) ++largeMotion;
+        }
+        if (largeMotion > static_cast<int>(snap.size()) * 3 / 4) {
+            LOGI("stitchForInpaint: early abort — %d/%zu frames have >20° "
+                 "camera rotation. Phone moved too much.",
+                 largeMotion, snap.size());
+            return false;
+        }
+    }
     auto aligned = alignToReference(reference, snap);
+
+    // Replace each aligned frame's anyPersonMask with REMOVE-only version.
+    // The aligner already used the full anyPersonMask for feature masking
+    // (correct: we don't want keypoints on ANY person). Now the stitcher
+    // needs to know which pixels are REMOVE-person (skip) vs KEEP-person
+    // (valid background). KEEP person pixels become usable samples.
+    if (!removeIds.empty()) {
+        const cv::Size refSize = reference.image.size();
+        for (auto& af : aligned) {
+            if (!af.valid) continue;
+            cv::Mat removeOnly = cv::Mat::zeros(refSize, CV_8UC1);
+            const size_t nm = std::min(af.personMasks.size(),
+                                       af.personTrackIds.size());
+            for (size_t mi = 0; mi < nm; ++mi) {
+                if (removeIds.count(af.personTrackIds[mi])) {
+                    cv::bitwise_or(removeOnly, af.personMasks[mi], removeOnly);
+                }
+            }
+            af.anyPersonMask = removeOnly;
+        }
+    }
+
     auto t1 = clk::now();
     auto result = stitch(reference, dilatedHole, aligned);
+
+    detectGhostPixels(result.image, dilatedHole, result.stillUnfilled,
+                      result.sampleCount);
+
     auto t2 = clk::now();
 
     // Sharpness recovery: unsharp mask inside the hole. The temporal median
@@ -502,13 +637,14 @@ JNIEXPORT jboolean JNICALL
 Java_com_one5_personremoval_core_NativeSession_nativeStitchForInpaint(
         JNIEnv* env, jclass /*clazz*/, jlong handle,
         jbyteArray removeMask, jint maskW, jint maskH,
+        jintArray removeTrackIds,
         jobjectArray outArr) {
     auto* s = asSession(handle);
     if (!s) return JNI_FALSE;
     if (!outArr || env->GetArrayLength(outArr) < 6) return JNI_FALSE;
     if (!removeMask || maskW <= 0 || maskH <= 0) return JNI_FALSE;
     if (env->GetArrayLength(removeMask) < (jsize)((size_t)maskW * maskH)) return JNI_FALSE;
-    return runStitchForInpaint(s, env, removeMask, maskW, maskH, outArr) ? JNI_TRUE : JNI_FALSE;
+    return runStitchForInpaint(s, env, removeMask, maskW, maskH, removeTrackIds, outArr) ? JNI_TRUE : JNI_FALSE;
 }
 
 /**

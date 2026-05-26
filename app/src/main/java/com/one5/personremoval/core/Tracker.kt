@@ -10,7 +10,7 @@ import kotlin.math.min
  */
 class Tracker(
     private val iouThreshold: Float = 0.2f,
-    private val maxGapMs: Long = 500L
+    private val maxGapMs: Long = 1000L
 ) {
 
     private data class Track(
@@ -44,6 +44,24 @@ class Tracker(
                 if (used[i]) continue
                 val v = iou(det.bBox, tracks[i].bbox)
                 if (v > bestIoU) { bestIoU = v; bestIdx = i }
+            }
+            // Fallback: center-distance match for walking persons whose
+            // IoU dropped below threshold due to large frame-to-frame shift.
+            if (bestIdx < 0) {
+                val cx = (det.bBox.left + det.bBox.right) / 2f
+                val cy = (det.bBox.top + det.bBox.bottom) / 2f
+                val detW = det.bBox.right - det.bBox.left
+                val detH = det.bBox.bottom - det.bBox.top
+                val maxDist = max(detW, detH) * 1.5f
+                var bestDist = maxDist
+                for (i in 0 until originalSize) {
+                    if (used[i]) continue
+                    val t = tracks[i]
+                    val tcx = (t.bbox.left + t.bbox.right) / 2f
+                    val tcy = (t.bbox.top + t.bbox.bottom) / 2f
+                    val dist = kotlin.math.sqrt((cx - tcx) * (cx - tcx) + (cy - tcy) * (cy - tcy))
+                    if (dist < bestDist) { bestDist = dist; bestIdx = i }
+                }
             }
             if (bestIdx >= 0) {
                 val t = tracks[bestIdx]

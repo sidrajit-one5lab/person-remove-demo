@@ -52,9 +52,9 @@ cv::Mat prepareSafeMask(const cv::Mat& holeMask, int border) {
 cv::Point maskBboxCenter(const cv::Mat& mask) {
     cv::Rect bbox = cv::boundingRect(mask);
     if (bbox.width == 0 || bbox.height == 0) {
-        return cv::Point(mask.cols / 2, mask.rows / 2);
+        return {mask.cols / 2, mask.rows / 2};
     }
-    return cv::Point(bbox.x + bbox.width / 2, bbox.y + bbox.height / 2);
+    return {bbox.x + bbox.width / 2, bbox.y + bbox.height / 2};
 }
 
 /**

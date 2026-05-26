@@ -23,6 +23,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     /** Pointer to the native Session struct. 0 means closed. Mutated under [opLock]. */
     private var handle: Long = nativeCreate(capacity)
 
+    @Volatile var frozen: Boolean = false
+
     /**
      * Push one camera frame into the ring buffer.
      *
@@ -37,15 +39,14 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         height: Int,
         personMasks: Array<ByteArray>,
         timestampMs: Long,
-        rotation9: FloatArray? = null
+        rotation9: FloatArray? = null,
+        trackIds: IntArray? = null
     ) {
-        // tryLock: if a capture is in progress (stitch can take 1–3s), drop this
-        // frame rather than block the analyzer pipeline behind it. The buffer
-        // shouldn't grow during capture anyway — we're stitching from history.
+        if (frozen) return
         if (!opLock.tryLock()) return
         try {
             if (handle != 0L) nativePushFrame(
-                handle, rgba, width, height, personMasks, timestampMs, rotation9
+                handle, rgba, width, height, personMasks, timestampMs, rotation9, trackIds
             )
         } finally {
             opLock.unlock()
@@ -116,7 +117,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     fun stitchForInpaint(
         removeMask: ByteArray,
         maskWidth: Int,
-        maskHeight: Int
+        maskHeight: Int,
+        removeTrackIds: IntArray = intArrayOf()
     ): StitchOutput? = opLock.withLock {
         if (handle == 0L) return@withLock null
         // outArr: [0]=rgb, [1]=originalRgb, [2]=unfilledMask, [3]=fullHoleMask,
@@ -124,7 +126,7 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         val outArr = arrayOfNulls<Any>(6)
         @Suppress("UNCHECKED_CAST")
         val ok = nativeStitchForInpaint(
-            handle, removeMask, maskWidth, maskHeight, outArr as Array<Any?>
+            handle, removeMask, maskWidth, maskHeight, removeTrackIds, outArr as Array<Any?>
         )
         if (!ok) return@withLock null
         val rgb         = outArr[0] as? ByteArray ?: return@withLock null
@@ -221,13 +223,15 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             height: Int,
             personMasks: Array<ByteArray>,
             timestampMs: Long,
-            rotation9: FloatArray?
+            rotation9: FloatArray?,
+            trackIds: IntArray?
         )
         @JvmStatic private external fun nativeTestAlignment(handle: Long): Int
         @JvmStatic private external fun nativeTestStitch(handle: Long): ByteArray?
         @JvmStatic private external fun nativeStitchForInpaint(
             handle: Long,
             removeMask: ByteArray, maskW: Int, maskH: Int,
+            removeTrackIds: IntArray,
             out: Array<Any?>
         ): Boolean
         @JvmStatic private external fun nativeOpencvInpaint(
