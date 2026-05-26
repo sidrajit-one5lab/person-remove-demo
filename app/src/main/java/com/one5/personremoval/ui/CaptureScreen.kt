@@ -154,12 +154,6 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
                 .padding(horizontal = 16.dp, vertical = 32.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-//            Button(
-//                enabled = !isProcessing,
-//                onClick = { viewModel.onTestStitch() }
-//            ) {
-//                Text("Test Stitch")
-//            }
             Button(
                 enabled = !isProcessing,
                 onClick = { viewModel.onCapture() }

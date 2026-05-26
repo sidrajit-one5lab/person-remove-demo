@@ -76,7 +76,8 @@ class CaptureUseCase(
         val canMatte = refiner != null && refiner.isAvailable &&
                 referenceRgba != null && referenceRgba.size >= w * h * 4
         val removeMask = if (canMatte) {
-            val rgb = rgbaToRgb(referenceRgba!!, w, h)
+            val rgb = nativeSession.rgbaToRgb(referenceRgba!!, w, h)
+                ?: rgbaToRgb(referenceRgba, w, h)
             val alpha = refiner!!.refineRemoveMask(rgb, w, h, removePersons)
             val out = ByteArray(w * h)
             for (i in 0 until w * h) {
@@ -134,7 +135,8 @@ class CaptureUseCase(
         }
 
         if (useLama) {
-            harmonizeLamaRegion(filledRgb, stitch.unfilledMask, stitch.width, stitch.height)
+            nativeSession.harmonizeLamaRegion(
+                filledRgb, stitch.unfilledMask, stitch.width, stitch.height)
         }
 
         val polished = nativeSession.finalize(
@@ -143,23 +145,30 @@ class CaptureUseCase(
         ) ?: filledRgb
 
         val totalMs = System.currentTimeMillis() - t0
+        // Report `actualFill` (recomputed above) instead of the raw native
+        // `stitch.fillRatio`. The native ratio is measured before the ghost
+        // detector flags additional unfilled pixels, so it overstates how
+        // much of the hole was filled by real samples. Routing decisions
+        // already use `actualFill`; logs, toast, and hint buckets must use
+        // the same number or the user sees one value while the pipeline
+        // routed off a different one.
         Log.i(TAG,
-            "pipeline done method=$inpaintMethod fill=%.2f noSample=%.2f total=${totalMs}ms"
-                .format(stitch.fillRatio, stitch.noSampleRatio))
+            "pipeline done method=$inpaintMethod fill=%.2f (native=%.2f) noSample=%.2f total=${totalMs}ms"
+                .format(actualFill, stitch.fillRatio, stitch.noSampleRatio))
 
         val baseStatus = "fill=%.2f via %s  %dms".format(
-            stitch.fillRatio, inpaintMethod, totalMs)
+            actualFill, inpaintMethod, totalMs)
         // noSampleRatio > 0.3 → at least 30% of the hole has zero clean-bg
         // samples across the entire buffer window. No amount of waiting will
         // recover those pixels because the subject occluded them every frame;
         // the user must move the subject (or shift the camera) before retake.
         // Fall back to the older fill-based hint for borderline captures.
         val status = when {
-            stitch.fillRatio < 0.25f ->
+            actualFill < 0.25f ->
                 "$baseStatus  — keep phone steady and ask subject to step aside"
             stitch.noSampleRatio >= 0.30f ->
                 "$baseStatus  — large area never visible; ask subject to step aside briefly and retake"
-            stitch.fillRatio < 0.50f ->
+            actualFill < 0.50f ->
                 "$baseStatus  — tricky scene, try stepping out of frame for a few seconds and retake"
             else -> baseStatus
         }
@@ -219,69 +228,8 @@ class CaptureUseCase(
         return removeMask
     }
 
-    /**
-     * Shift the LaMa-filled region's mean R/G/B to match a band of real
-     * pixels just outside the unfilled mask. Fixes the washed-out / hazy
-     * brightness that LaMa produces when hallucinating large areas.
-     * Operates in-place on [rgb].
-     */
-    private fun harmonizeLamaRegion(rgb: ByteArray, mask: ByteArray, w: Int, h: Int) {
-        val n = w * h
-        if (rgb.size < n * 3 || mask.size < n) return
-
-        val bandPx = 20
-        var outerR = 0L; var outerG = 0L; var outerB = 0L; var outerN = 0
-        var innerR = 0L; var innerG = 0L; var innerB = 0L; var innerN = 0
-
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val i = y * w + x
-                val isMask = mask[i].toInt() != 0
-                if (isMask) {
-                    innerR += rgb[i * 3].toInt() and 0xFF
-                    innerG += rgb[i * 3 + 1].toInt() and 0xFF
-                    innerB += rgb[i * 3 + 2].toInt() and 0xFF
-                    innerN++
-                } else {
-                    val nearMask = (x > 0 && mask[i - 1].toInt() != 0) ||
-                            (x < w - 1 && mask[i + 1].toInt() != 0) ||
-                            (y > 0 && mask[i - w].toInt() != 0) ||
-                            (y < h - 1 && mask[i + w].toInt() != 0)
-                    if (!nearMask) continue
-                    val yLo = maxOf(0, y - bandPx); val yHi = minOf(h - 1, y + bandPx)
-                    val xLo = maxOf(0, x - bandPx); val xHi = minOf(w - 1, x + bandPx)
-                    var inBand = false
-                    bandCheck@ for (by in yLo..yHi step 4) {
-                        for (bx in xLo..xHi step 4) {
-                            if (mask[by * w + bx].toInt() != 0) { inBand = true; break@bandCheck }
-                        }
-                    }
-                    if (inBand) {
-                        outerR += rgb[i * 3].toInt() and 0xFF
-                        outerG += rgb[i * 3 + 1].toInt() and 0xFF
-                        outerB += rgb[i * 3 + 2].toInt() and 0xFF
-                        outerN++
-                    }
-                }
-            }
-        }
-
-        if (outerN < 500 || innerN < 200) return
-        val dr = (outerR.toFloat() / outerN - innerR.toFloat() / innerN).toInt().coerceIn(-15, 15)
-        val dg = (outerG.toFloat() / outerN - innerG.toFloat() / innerN).toInt().coerceIn(-15, 15)
-        val db = (outerB.toFloat() / outerN - innerB.toFloat() / innerN).toInt().coerceIn(-15, 15)
-
-        if (dr == 0 && dg == 0 && db == 0) return
-        Log.i(TAG, "harmonize: shift R=$dr G=$dg B=$db (outer=$outerN inner=$innerN)")
-
-        for (i in 0 until n) {
-            if (mask[i].toInt() == 0) continue
-            rgb[i * 3]     = ((rgb[i * 3].toInt() and 0xFF) + dr).coerceIn(0, 255).toByte()
-            rgb[i * 3 + 1] = ((rgb[i * 3 + 1].toInt() and 0xFF) + dg).coerceIn(0, 255).toByte()
-            rgb[i * 3 + 2] = ((rgb[i * 3 + 2].toInt() and 0xFF) + db).coerceIn(0, 255).toByte()
-        }
-    }
-
+    // Kotlin fallback for when nativeRgbaToRgb returns null (JNI byte-array
+    // pinning fails — practically only on OOM). Plain pixel reshape.
     private fun rgbaToRgb(rgba: ByteArray, w: Int, h: Int): ByteArray {
         val n = w * h
         val rgb = ByteArray(n * 3)

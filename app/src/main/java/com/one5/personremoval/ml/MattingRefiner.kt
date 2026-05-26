@@ -51,7 +51,7 @@ class MattingRefiner(
     context: Context,
     private val modelAsset: String = "modnet.onnx",
     private val workingSize: Int = 512,
-    private val paddingFrac: Float = 0.15f,
+    private val paddingFrac: Float = 0.35f,
     private val normalizeMode: NormalizeMode = NormalizeMode.SYMMETRIC
 ) : AutoCloseable {
 
@@ -282,6 +282,10 @@ class MattingRefiner(
 
     private fun rgbBytesToBitmap(rgb: ByteArray, w: Int, h: Int): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        if (com.one5.personremoval.core.NativeSession.fillBitmapFromRgb(rgb, w, h, bmp)) {
+            return bmp
+        }
+        // Native fast path failed; fall back to Kotlin packer.
         val pixels = IntArray(w * h)
         for (i in 0 until w * h) {
             val r = rgb[i * 3].toInt() and 0xFF

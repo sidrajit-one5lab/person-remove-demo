@@ -32,10 +32,10 @@ import kotlin.math.min
 class YoloSegmenter(
     context: Context,
     private val modelAsset: String = "yolov8n-seg.tflite",
-    // 0.3 (rather than the more common 0.4) so we catch weaker detections of
+    // 0.25 (rather than the more common 0.4) so we catch weaker detections of
     // partially-occluded body parts (a person behind a counter, hands-only on a
     // workbench, etc.). The COCO `person` class has very low false-positive
-    // density above ~0.25, so the cost is just a few stray chair/mannequin
+    // density at this level, so the cost is just a few stray chair/mannequin
     // boxes that the user can ignore.
     private val confidenceThreshold: Float = 0.25f,
     private val iouThreshold: Float = 0.5f,
@@ -150,7 +150,33 @@ class YoloSegmenter(
         data class Det(
             val cx: Float, val cy: Float, val w: Float, val h: Float,
             val conf: Float, val coeffs: FloatArray
-        )
+        ) {
+            override fun equals(other: Any?): Boolean {
+                if (this === other) return true
+                if (javaClass != other?.javaClass) return false
+
+                other as Det
+
+                if (cx != other.cx) return false
+                if (cy != other.cy) return false
+                if (w != other.w) return false
+                if (h != other.h) return false
+                if (conf != other.conf) return false
+                if (!coeffs.contentEquals(other.coeffs)) return false
+
+                return true
+            }
+
+            override fun hashCode(): Int {
+                var result = cx.hashCode()
+                result = 31 * result + cy.hashCode()
+                result = 31 * result + w.hashCode()
+                result = 31 * result + h.hashCode()
+                result = 31 * result + conf.hashCode()
+                result = 31 * result + coeffs.contentHashCode()
+                return result
+            }
+        }
 
         val candidates = ArrayList<Det>(64)
         val personRow = feat[4 + personClassIndex]

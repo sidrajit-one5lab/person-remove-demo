@@ -65,6 +65,22 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     @Volatile private var latestRgbaW: Int = 0
     @Volatile private var latestRgbaH: Int = 0
 
+    // Two-slot ping-pong for the analyzer RGBA buffer. The analyzer writes
+    // into one slot, publishes the reference via `latestRgba`, and toggles
+    // to the other slot for the next frame. Eliminates the per-frame
+    // ~8 MB allocation that dominated analyzer-thread GC pressure on
+    // low-end devices. Safe because the capture coroutine only reads
+    // `latestRgba` while `_isProcessing == true`, during which the
+    // analyzer bails at the top of `collectLatest` and does not write.
+    // After capture re-enables the analyzer the next write lands in the
+    // *other* slot (toggle persists across the capture), so the slot
+    // capture had been holding cannot be overwritten mid-read. Touched
+    // only by the analyzer coroutine, no synchronization needed.
+    private var frameSlotA: ByteArray? = null
+    private var frameSlotB: ByteArray? = null
+    private var frameSlotBytes: Int = 0
+    private var nextSlotIsB: Boolean = false
+
     // AE re-lock on large camera motion. When the user physically moves
     // (walks to different position), exposure/WB lock becomes stale. Track
     // the gyro rotation at lock time; if angular displacement exceeds the
@@ -135,7 +151,18 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     val plane = proxy.planes[0]
                     val buf = plane.buffer
                     val rowStride = plane.rowStride
-                    val rgba = ByteArray(w * h * 4)
+                    val needed = w * h * 4
+                    // Lazy (re)allocation: only on first frame, or when the
+                    // analyzer resolution actually changes (e.g. camera flip
+                    // returns a different ImageAnalysis profile). Steady-state
+                    // path hits neither branch.
+                    if (frameSlotBytes != needed) {
+                        frameSlotA = ByteArray(needed)
+                        frameSlotB = ByteArray(needed)
+                        frameSlotBytes = needed
+                        nextSlotIsB = false
+                    }
+                    val rgba = if (nextSlotIsB) frameSlotB!! else frameSlotA!!
                     if (rowStride == w * 4) {
                         buf.get(rgba)
                     } else {
@@ -147,7 +174,15 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                             System.arraycopy(tmp, 0, rgba, y * rowBytes, rowBytes)
                         }
                     }
-                    val raw = segmenter.detect(rgba, w, h)
+                    val raw = try {
+                        segmenter.detect(rgba, w, h)
+                    } catch (t: Throwable) {
+                        // YOLO inference failure on a single frame must not
+                        // tear down the analyzer pipeline. Skip this frame,
+                        // log, and continue with the next one.
+                        Log.w(TAG, "YOLO detect threw, skipping frame", t)
+                        return@collectLatest
+                    }
                     val nowMs = System.currentTimeMillis()
                     val (tracked, states) = tracker.update(raw.persons, nowMs)
 
@@ -156,13 +191,19 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     val rot = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
                     nativeSession.pushFrame(rgba, w, h, masks, nowMs, rot, trackIds)
 
-                    // Snapshot for matting refinement at capture time. The
-                    // ByteArray is owned by this loop iteration; reassigning
-                    // the @Volatile reference is the publish step. The
-                    // capture coroutine reads atomically.
+                    // Snapshot for matting refinement at capture time.
+                    // Publish the just-filled slot via the @Volatile
+                    // reference; the capture coroutine reads atomically.
+                    // Toggle AFTER publishing so the next frame writes
+                    // into the OTHER slot — the one capture cannot be
+                    // holding. Cancellation of this collectLatest block
+                    // (mid-detect / mid-pushFrame) leaves the toggle
+                    // untouched and reuses the same slot on retry, which
+                    // is safe because no consumer ever observed it.
                     latestRgba = rgba
                     latestRgbaW = w
                     latestRgbaH = h
+                    nextSlotIsB = !nextSlotIsB
 
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
@@ -235,36 +276,40 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun onTestStitch() {
-        if (_isProcessing.value) return
-        _isProcessing.value = true
-        viewModelScope.launch(Dispatchers.Default) {
-            try {
-                val d = _detection.value
-                val states = tracker.getStates()
-                val (result, status) = if (d != null) {
-                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight,
-                            referenceRgba = latestRgba)
-                } else {
-                    null to "no detection yet"
-                }
-                _lastResultText.value = status
-                _stitchPreview.value = result?.let {
-                    rgbBytesToBitmap(it.rgb, it.width, it.height)
-                }
-            } finally {
-                _isProcessing.value = false
-            }
-        }
-    }
 
     fun onCapture() {
         if (_isProcessing.value) return
         _isProcessing.value = true
-        nativeSession.frozen = true
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                delay(1500L)
+                // Stillness gate. Replaces the old fixed 1.5 s post-tap
+                // delay with an adaptive wait: poll the gyro and freeze
+                // the buffer as soon as the phone stops moving, capped
+                // at STILLNESS_MAX_WAIT_MS. The cap covers devices with
+                // no gyro (recentAngularVelocityRadPerSec returns +∞) and
+                // shaky-handed captures that never settle. On still phones
+                // the gate completes in one poll cycle (~25 ms) — the user
+                // sees an immediate shutter.
+                val stillnessStart = System.currentTimeMillis()
+                while (true) {
+                    val omega = gyroIntegrator.recentAngularVelocityRadPerSec()
+                    val elapsed = System.currentTimeMillis() - stillnessStart
+                    if (omega < STILLNESS_THRESHOLD_RAD_PER_SEC) {
+                        Log.i(TAG, "stillness ok after ${elapsed}ms (ω=$omega rad/s)")
+                        break
+                    }
+                    if (elapsed >= STILLNESS_MAX_WAIT_MS) {
+                        Log.i(TAG, "stillness timeout at ${elapsed}ms (ω=$omega rad/s) — capturing anyway")
+                        break
+                    }
+                    delay(STILLNESS_POLL_MS)
+                }
+
+                // freeze before launching the pipeline. New pushFrame() calls bail
+                // early on `frozen == true`, and stitchForInpaint() blocks on the
+                // same opLock that pushFrame holds, so any in-flight push completes
+                // before stitching reads the buffer. No additional wait needed.
+                nativeSession.frozen = true
                 val hiResDeferred = async { cameraManager.captureHighRes() }
 
                 val d = _detection.value
@@ -352,6 +397,18 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         segmenter.close()
         mattingRefiner.close()
         nativeSession.close()
+    }
+
+    companion object {
+        private const val TAG = "CaptureViewModel"
+        // Stillness gate parameters. 0.15 rad/s ≈ 8.6°/s — typical "holding
+        // phone reasonably still" angular speed. Tighter (e.g. 0.05) waits
+        // out micro-tremor at the cost of frequent timeouts in normal use;
+        // looser would let blur sneak in. 500 ms hard cap so the shutter
+        // never feels broken.
+        private const val STILLNESS_THRESHOLD_RAD_PER_SEC = 0.15f
+        private const val STILLNESS_MAX_WAIT_MS = 500L
+        private const val STILLNESS_POLL_MS = 25L
     }
 }
 

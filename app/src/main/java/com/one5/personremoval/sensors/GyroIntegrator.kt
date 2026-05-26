@@ -55,6 +55,14 @@ class GyroIntegrator(context: Context) : SensorEventListener {
     private var lastTimestampNs: Long = 0L
     private var running: Boolean = false
 
+    // Most recent sample's angular speed magnitude (rad/s) and the wall-clock
+    // ms at which it was recorded. Read by the capture coroutine via
+    // [recentAngularVelocityRadPerSec] to gate the shutter on phone
+    // stillness. Volatile because the writer is the sensor thread and the
+    // reader is the capture coroutine — no atomic read-modify-write needed.
+    @Volatile private var lastOmegaMagRadPerSec: Float = Float.POSITIVE_INFINITY
+    @Volatile private var lastOmegaWallMs: Long = 0L
+
     init {
         if (gyro == null) {
             Log.w(TAG, "Gyroscope not available on this device; rotation snapshots will be identity")
@@ -94,6 +102,21 @@ class GyroIntegrator(context: Context) : SensorEventListener {
         }
     }
 
+    /**
+     * Most recent angular speed magnitude in rad/s, or +∞ if no sample has
+     * arrived within [staleMs]. Used by the capture coroutine to wait for
+     * phone stillness before freezing the ring buffer — a fresh "tap →
+     * shutter" delay that adapts to actual motion instead of a fixed
+     * timeout. Returns +∞ when the device has no gyroscope so callers'
+     * threshold comparisons fall through to the max-wait fallback.
+     */
+    fun recentAngularVelocityRadPerSec(staleMs: Long = 200L): Float {
+        if (gyro == null) return Float.POSITIVE_INFINITY
+        val now = System.currentTimeMillis()
+        if (now - lastOmegaWallMs > staleMs) return Float.POSITIVE_INFINITY
+        return lastOmegaMagRadPerSec
+    }
+
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) { /* no-op */ }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -115,7 +138,14 @@ class GyroIntegrator(context: Context) : SensorEventListener {
         val wx = event.values[0]
         val wy = event.values[1]
         val wz = event.values[2]
-        val angle = sqrt((wx * wx + wy * wy + wz * wz).toDouble()) * dt
+        val omegaMag = sqrt((wx * wx + wy * wy + wz * wz).toDouble())
+        // Publish the instantaneous angular-speed magnitude before the
+        // sub-precision early-return below. Steady phone produces samples
+        // at gyro bias level (~0.005 rad/s); intentional motion is orders
+        // of magnitude larger, so the noise floor is fine for our use.
+        lastOmegaMagRadPerSec = omegaMag.toFloat()
+        lastOmegaWallMs = System.currentTimeMillis()
+        val angle = omegaMag * dt
         if (angle < 1e-9) return  // sub-precision; ignore
 
         // Rodrigues' rotation formula. Build incremental dR = I + sinθ K + (1-cosθ) K²

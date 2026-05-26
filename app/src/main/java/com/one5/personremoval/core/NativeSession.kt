@@ -71,15 +71,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     }
 
     /**
-     * Phase 8 verification: runs alignment + stitching, treating every person detected
-     * in the newest buffered frame as REMOVE. Returns the JPEG-encoded result image,
-     * or null if there's nothing to stitch (empty buffer or no people in reference).
-     */
-    fun testStitch(): ByteArray? = opLock.withLock {
-        if (handle == 0L) null else nativeTestStitch(handle)
-    }
-
-    /**
      * Phase 9 entry: runs stitching and returns everything the Kotlin side needs
      * to drive both the inpaint stage and the final seamless-clone blend.
      *  - `rgb`           : stitched RGB (reference with hole filled by real samples)
@@ -174,6 +165,25 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         nativeEncodeJpeg(rgb, width, height, quality)
 
     /**
+     * Drop the alpha channel from a CameraX RGBA_8888 byte array. Pure
+     * pixel reshape; uses OpenCV cv::cvtColor (SIMD on arm64).
+     */
+    fun rgbaToRgb(rgba: ByteArray, width: Int, height: Int): ByteArray? =
+        nativeRgbaToRgb(rgba, width, height)
+
+    /**
+     * In-place tint harmonization for the LaMa-filled region. Shifts the
+     * mean RGB of the masked pixels toward the 1-px ring of real pixels
+     * just outside, clamped to ±15 per channel. Modifies [rgb] in place.
+     */
+    fun harmonizeLamaRegion(
+        rgb: ByteArray,
+        mask: ByteArray,
+        width: Int,
+        height: Int
+    ): Unit = nativeHarmonizeLamaRegion(rgb, mask, width, height)
+
+    /**
      * Composite the low-res stitched patch into a high-res camera capture.
      * The low-res patch is bicubic-upscaled to the bitmap's dimensions; the
      * low-res hole mask is bilinear-upscaled and re-thresholded; the two are
@@ -211,7 +221,31 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         /** Returns the linked OpenCV version. Used by the sanity-check log on startup. */
         fun openCvVersion(): String = nativeOpenCvVersion()
 
+        /**
+         * Pack an RGB byte array into an existing ARGB_8888 Bitmap (alpha
+         * set to 0xFF). Returns true on success. Fast path replaces the
+         * Bitmap.setPixels(IntArray) per-pixel pack used by LamaInpainter
+         * and MattingRefiner.
+         */
+        fun fillBitmapFromRgb(
+            rgb: ByteArray, w: Int, h: Int, bmp: android.graphics.Bitmap
+        ): Boolean = nativeFillBitmapFromRgb(rgb, w, h, bmp)
+
+        /**
+         * Unpack RGB bytes from an ARGB_8888 Bitmap. Returns null on
+         * failure (wrong format, lock failure, OOM); caller should fall
+         * back to Bitmap.getPixels().
+         */
+        fun readRgbFromBitmap(bmp: android.graphics.Bitmap): ByteArray? =
+            nativeReadRgbFromBitmap(bmp)
+
         @JvmStatic private external fun nativeOpenCvVersion(): String
+        @JvmStatic private external fun nativeFillBitmapFromRgb(
+            rgb: ByteArray, w: Int, h: Int, bmp: android.graphics.Bitmap
+        ): Boolean
+        @JvmStatic private external fun nativeReadRgbFromBitmap(
+            bmp: android.graphics.Bitmap
+        ): ByteArray?
         @JvmStatic private external fun nativeCreate(capacity: Int): Long
         @JvmStatic private external fun nativeDestroy(handle: Long)
         @JvmStatic private external fun nativeBufferSize(handle: Long): Int
@@ -227,7 +261,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             trackIds: IntArray?
         )
         @JvmStatic private external fun nativeTestAlignment(handle: Long): Int
-        @JvmStatic private external fun nativeTestStitch(handle: Long): ByteArray?
         @JvmStatic private external fun nativeStitchForInpaint(
             handle: Long,
             removeMask: ByteArray, maskW: Int, maskH: Int,
@@ -248,5 +281,11 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             hiResBitmap: android.graphics.Bitmap,
             stitchedLoRgb: ByteArray, holeLo: ByteArray, loW: Int, loH: Int
         ): ByteArray?
+        @JvmStatic private external fun nativeRgbaToRgb(
+            rgba: ByteArray, width: Int, height: Int
+        ): ByteArray?
+        @JvmStatic private external fun nativeHarmonizeLamaRegion(
+            rgb: ByteArray, mask: ByteArray, width: Int, height: Int
+        )
     }
 }

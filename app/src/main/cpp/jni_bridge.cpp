@@ -306,71 +306,6 @@ Java_com_one5_personremoval_core_NativeSession_nativeTestAlignment(
     return ok;
 }
 
-/**
- * Phase 8 verification.
- *   1. Snapshot buffer, newest frame = reference.
- *   2. Build hole mask = union of all per-person masks in the reference (treat
- *      every detected person as REMOVE for testing purposes).
- *   3. Align older frames to reference.
- *   4. Run stitching.
- *   5. Encode the stitched RGB image as a JPEG and return the bytes.
- *
- * Returns null if the buffer is empty or no people were detected in the reference.
- */
-JNIEXPORT jbyteArray JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeTestStitch(
-        JNIEnv* env, jclass /*clazz*/, jlong handle) {
-
-    auto* s = asSession(handle);
-    if (!s) return nullptr;
-
-    auto snap = s->buffer->snapshot();
-    if (snap.empty()) {
-        LOGI("testStitch: buffer empty");
-        return nullptr;
-    }
-
-    BufferedFrame reference = std::move(snap.back());
-    snap.pop_back();
-
-    if (reference.anyPersonMask.empty() ||
-        cv::countNonZero(reference.anyPersonMask) == 0) {
-        LOGI("testStitch: no people detected in reference frame");
-        return nullptr;
-    }
-
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-    auto aligned = alignToReference(reference, snap);
-    auto t1 = clk::now();
-    auto result = stitch(reference, reference.anyPersonMask, aligned);
-    auto t2 = clk::now();
-
-    auto alignMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    auto stitchMs = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-    LOGI("testStitch: align=%lldms stitch=%lldms fill=%.2f",
-         (long long)alignMs, (long long)stitchMs, result.realFillRatio);
-
-    if (result.image.empty()) return nullptr;
-
-    // OpenCV's JPEG encoder wants BGR; our images are RGB.
-    cv::Mat bgr;
-    cv::cvtColor(result.image, bgr, cv::COLOR_RGB2BGR);
-
-    std::vector<uchar> jpeg;
-    std::vector<int> params{cv::IMWRITE_JPEG_QUALITY, 90};
-    if (!cv::imencode(".jpg", bgr, jpeg, params)) {
-        LOGI("testStitch: imencode failed");
-        return nullptr;
-    }
-
-    jbyteArray out = env->NewByteArray(static_cast<jsize>(jpeg.size()));
-    if (!out) return nullptr;
-    env->SetByteArrayRegion(out, 0, static_cast<jsize>(jpeg.size()),
-                            reinterpret_cast<const jbyte*>(jpeg.data()));
-    return out;
-}
-
 } // extern "C"
 
 // -------------------------------------------------------------------------- //
@@ -1062,6 +997,228 @@ Java_com_one5_personremoval_ml_YoloSegmenter_nativeFillInputBuffer(
         resized.copyTo(padded(cv::Rect(padX, padY, dstW, dstH)));
         memcpy(bufPtr, padded.data, INPUT_SIZE * INPUT_SIZE * 3);
     }
+}
+
+/**
+ * RGBA → RGB byte conversion. OpenCV cv::cvtColor uses SIMD on arm64.
+ * Replaces the Kotlin per-pixel loop in CaptureUseCase.rgbaToRgb that
+ * cost ~30-60 ms per capture at analyzer resolution.
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeRgbaToRgb(
+        JNIEnv* env, jclass /*clazz*/,
+        jbyteArray rgba, jint w, jint h) {
+    if (w <= 0 || h <= 0) return nullptr;
+    const size_t rgbaLen = static_cast<size_t>(w) * h * 4;
+    const size_t rgbLen  = static_cast<size_t>(w) * h * 3;
+    if (env->GetArrayLength(rgba) < (jsize)rgbaLen) return nullptr;
+
+    jbyte* rgbaPtr = env->GetByteArrayElements(rgba, nullptr);
+    if (!rgbaPtr) return nullptr;
+    cv::Mat rgbaMat(h, w, CV_8UC4, rgbaPtr);
+    cv::Mat rgbMat;
+    cv::cvtColor(rgbaMat, rgbMat, cv::COLOR_RGBA2RGB);
+    env->ReleaseByteArrayElements(rgba, rgbaPtr, JNI_ABORT);
+
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(rgbLen));
+    if (!out) return nullptr;
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgbLen),
+                            reinterpret_cast<const jbyte*>(rgbMat.data));
+    return out;
+}
+
+/**
+ * In-place tint harmonization for the LaMa-filled region. Computes the
+ * mean RGB shift between the unfilled mask interior and the 1-px ring of
+ * real pixels immediately outside, then applies the (clamped) shift to
+ * every masked pixel. Faithful port of CaptureUseCase.harmonizeLamaRegion;
+ * the 41×41 mask-presence sampling on a 4-px grid is preserved verbatim.
+ *
+ * Cost on the Kotlin side was 150-250 ms (double full-image loop). The
+ * native version drops it to ~5-15 ms — same algorithm, but raw pointer
+ * loops + sequential RGB indexing keep it inside the L1 cache.
+ */
+JNIEXPORT void JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeHarmonizeLamaRegion(
+        JNIEnv* env, jclass /*clazz*/,
+        jbyteArray rgb, jbyteArray mask, jint w, jint h) {
+    if (w <= 0 || h <= 0) return;
+    const size_t rgbLen  = static_cast<size_t>(w) * h * 3;
+    const size_t maskLen = static_cast<size_t>(w) * h;
+    if (env->GetArrayLength(rgb)  < (jsize)rgbLen)  return;
+    if (env->GetArrayLength(mask) < (jsize)maskLen) return;
+
+    jbyte* rgbPtr  = env->GetByteArrayElements(rgb, nullptr);
+    jbyte* maskPtr = env->GetByteArrayElements(mask, nullptr);
+    if (!rgbPtr || !maskPtr) {
+        if (rgbPtr)  env->ReleaseByteArrayElements(rgb, rgbPtr, JNI_ABORT);
+        if (maskPtr) env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
+        return;
+    }
+
+    auto* rgbU  = reinterpret_cast<uint8_t*>(rgbPtr);
+    auto* maskU = reinterpret_cast<const uint8_t*>(maskPtr);
+
+    constexpr int BAND_PX = 20;
+    int64_t innerR = 0, innerG = 0, innerB = 0, innerN = 0;
+    int64_t outerR = 0, outerG = 0, outerB = 0, outerN = 0;
+
+    for (int y = 0; y < h; ++y) {
+        const int rowBase = y * w;
+        for (int x = 0; x < w; ++x) {
+            const int i = rowBase + x;
+            if (maskU[i]) {
+                const int p = i * 3;
+                innerR += rgbU[p];
+                innerG += rgbU[p + 1];
+                innerB += rgbU[p + 2];
+                ++innerN;
+                continue;
+            }
+            const bool nearMask =
+                    (x > 0     && maskU[i - 1]) ||
+                    (x < w - 1 && maskU[i + 1]) ||
+                    (y > 0     && maskU[i - w]) ||
+                    (y < h - 1 && maskU[i + w]);
+            if (!nearMask) continue;
+            const int yLo = std::max(0, y - BAND_PX);
+            const int yHi = std::min(h - 1, y + BAND_PX);
+            const int xLo = std::max(0, x - BAND_PX);
+            const int xHi = std::min(w - 1, x + BAND_PX);
+            bool inBand = false;
+            for (int by = yLo; by <= yHi && !inBand; by += 4) {
+                const int br = by * w;
+                for (int bx = xLo; bx <= xHi; bx += 4) {
+                    if (maskU[br + bx]) { inBand = true; break; }
+                }
+            }
+            if (!inBand) continue;
+            const int p = i * 3;
+            outerR += rgbU[p];
+            outerG += rgbU[p + 1];
+            outerB += rgbU[p + 2];
+            ++outerN;
+        }
+    }
+
+    auto release = [&](){
+        env->ReleaseByteArrayElements(rgb,  rgbPtr,  0);  // commit rgb writes
+        env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
+    };
+
+    if (outerN < 500 || innerN < 200) { release(); return; }
+
+    const auto clamp15 = [](int v) {
+        return v < -15 ? -15 : (v > 15 ? 15 : v);
+    };
+    const int dr = clamp15(static_cast<int>(
+            static_cast<float>(outerR) / outerN -
+            static_cast<float>(innerR) / innerN));
+    const int dg = clamp15(static_cast<int>(
+            static_cast<float>(outerG) / outerN -
+            static_cast<float>(innerG) / innerN));
+    const int db = clamp15(static_cast<int>(
+            static_cast<float>(outerB) / outerN -
+            static_cast<float>(innerB) / innerN));
+
+    if (dr == 0 && dg == 0 && db == 0) { release(); return; }
+
+    LOGI("harmonize: shift R=%d G=%d B=%d (outer=%lld inner=%lld)",
+         dr, dg, db, (long long)outerN, (long long)innerN);
+
+    const auto clamp255 = [](int v) {
+        return v < 0 ? uint8_t(0) : (v > 255 ? uint8_t(255) : uint8_t(v));
+    };
+    const int n = w * h;
+    for (int i = 0; i < n; ++i) {
+        if (!maskU[i]) continue;
+        const int p = i * 3;
+        rgbU[p]     = clamp255(static_cast<int>(rgbU[p])     + dr);
+        rgbU[p + 1] = clamp255(static_cast<int>(rgbU[p + 1]) + dg);
+        rgbU[p + 2] = clamp255(static_cast<int>(rgbU[p + 2]) + db);
+    }
+
+    release();
+}
+
+/**
+ * Fill an existing ARGB_8888 bitmap from a packed RGB byte array. Bitmap
+ * dimensions must match (w, h). Alpha is set to 0xFF for every pixel.
+ * Uses AndroidBitmap_lockPixels + cv::cvtColor (SIMD on arm64). Replaces
+ * the Kotlin Bitmap.setPixels(IntArray) path in LamaInpainter and
+ * MattingRefiner that allocated an IntArray + per-pixel pack on every
+ * inpaint invocation.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeFillBitmapFromRgb(
+        JNIEnv* env, jclass /*clazz*/,
+        jbyteArray rgb, jint w, jint h, jobject bitmap) {
+    if (w <= 0 || h <= 0 || !bitmap) return JNI_FALSE;
+    const size_t rgbLen = static_cast<size_t>(w) * h * 3;
+    if (env->GetArrayLength(rgb) < (jsize)rgbLen) return JNI_FALSE;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        return JNI_FALSE;
+    }
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 ||
+        (int)info.width != w || (int)info.height != h) {
+        return JNI_FALSE;
+    }
+
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        !pixels) {
+        return JNI_FALSE;
+    }
+
+    jbyte* rgbPtr = env->GetByteArrayElements(rgb, nullptr);
+    if (!rgbPtr) {
+        AndroidBitmap_unlockPixels(env, bitmap);
+        return JNI_FALSE;
+    }
+    cv::Mat rgbMat(h, w, CV_8UC3, rgbPtr);
+    cv::Mat rgbaMat(h, w, CV_8UC4, pixels, (size_t)info.stride);
+    cv::cvtColor(rgbMat, rgbaMat, cv::COLOR_RGB2RGBA);
+    env->ReleaseByteArrayElements(rgb, rgbPtr, JNI_ABORT);
+    AndroidBitmap_unlockPixels(env, bitmap);
+    return JNI_TRUE;
+}
+
+/**
+ * Read RGB bytes (drop alpha) from an ARGB_8888 bitmap into a fresh
+ * byte array. SIMD cvtColor in place of per-pixel IntArray unpack.
+ */
+JNIEXPORT jbyteArray JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeReadRgbFromBitmap(
+        JNIEnv* env, jclass /*clazz*/, jobject bitmap) {
+    if (!bitmap) return nullptr;
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        return nullptr;
+    }
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return nullptr;
+
+    void* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
+        !pixels) {
+        return nullptr;
+    }
+
+    cv::Mat rgbaMat((int)info.height, (int)info.width, CV_8UC4, pixels,
+                    (size_t)info.stride);
+    cv::Mat rgbMat;
+    cv::cvtColor(rgbaMat, rgbMat, cv::COLOR_RGBA2RGB);
+    AndroidBitmap_unlockPixels(env, bitmap);
+
+    const size_t rgbLen =
+            static_cast<size_t>(info.width) * info.height * 3;
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(rgbLen));
+    if (!out) return nullptr;
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgbLen),
+                            reinterpret_cast<const jbyte*>(rgbMat.data));
+    return out;
 }
 
 }

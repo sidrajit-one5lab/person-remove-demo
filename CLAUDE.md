@@ -17,7 +17,7 @@ PersonRemoval is an Android app that removes people from photos in real-time. Th
 
 The project targets **arm64-v8a only** (NDK ABI filter). It will not build native code for x86/x86_64 emulators — use a physical arm64 device or an arm64 emulator image.
 
-The app requires `android:largeHeap="true"` — the ring buffer holds ~30 frames at ~8 MB each (~240 MB total).
+The app requires `android:largeHeap="true"` — the ring buffer holds up to 80 frames at ~4 MB each (~320 MB peak; rarely full).
 
 ## Project Structure
 
@@ -30,7 +30,7 @@ Two Gradle modules: `:app` (the application) and `:opencv` (local OpenCV SDK, co
 - **`ui/CaptureScreen`** — Main composable. Owns the camera preview, detection loop, tap-to-toggle interaction, and the capture pipeline (`runPipeline()`). This is where the stitch → inpaint → finalize → composite → save flow lives.
 - **`ui/MaskOverlay`** — Draws bbox overlays (green=KEEP, red=REMOVE) on the camera preview.
 - **`camera/CameraManager`** — CameraX wrapper. Exposes analyzer frames as a `Flow<ImageProxy>` (mailbox pattern, not buffered flow). Also binds `ImageCapture` for full-sensor-resolution photos used in the hi-res composite path.
-- **`ml/YoloSegmenter`** — YOLOv8n-seg inference via LiteRT (TensorFlow Lite). Produces per-person bounding boxes + binary instance masks. Tries NNAPI → GPU → CPU delegates in order.
+- **`ml/YoloSegmenter`** — YOLOv8n-seg inference via LiteRT (TensorFlow Lite). Produces per-person bounding boxes + binary instance masks. Tries NNAPI → GPU → CPU delegates in order. Default `confidenceThreshold = 0.25` (recall-biased; false positives are cheap because the user just doesn't tap them).
 - **`ml/LamaInpainter`** — LaMa inpainting via ONNX Runtime. Fixed 512x512 input. Has two strategies: `inpaint()` (whole-frame downsample) and `inpaintGaps()` (per-gap crops with context padding — higher quality, used by default). Extracts the ~100 MB `.onnx` asset to internal storage on first launch.
 - **`core/NativeSession`** — JNI facade for the C++ engine. Manages a native ring buffer handle with a `ReentrantLock` to serialize JNI calls against `close()`. Key operations: `pushFrame`, `stitchForInpaint`, `finalize`, `compositeHighRes`.
 - **`core/Tracker`** — Greedy IoU tracker that assigns stable IDs across frames and persists KEEP/REMOVE state per track.
@@ -57,7 +57,7 @@ Built with CMake 3.22.1, C++17, linked against the local OpenCV module and `jnig
 
 1. **Detection loop** (continuous): CameraX analyzer → RGBA extraction → YoloSegmenter → Tracker → push frame+masks into NativeSession ring buffer
 2. **User taps** a person → Tracker toggles that trackId to REMOVE
-3. **Capture button** → 1.5s delay (post-tap buffer continuation) → parallel hi-res ImageCapture + `runPipeline()`:
+3. **Capture button** → freeze ring buffer (`nativeSession.frozen = true`) → parallel hi-res ImageCapture + `runPipeline()`:
    - Build REMOVE mask (per-pixel mask + optional bbox floor for large persons >25% frame area)
    - `stitchForInpaint()` — native alignment + temporal median stitch
    - Route by fill ratio: full=skip, high=OpenCV Telea, low=LaMa then Telea fallback
@@ -67,7 +67,7 @@ Built with CMake 3.22.1, C++17, linked against the local OpenCV module and `jnig
 
 ## Key Constraints
 
-- LaMa is currently disabled (threshold set to 0.95 effectively routes everything to OpenCV Telea) because fp32 inference takes 22-32s and produces worse results than Telea on large holes. Re-enable only with a faster/better model.
+- LaMa routing threshold is `actualFill < 0.85` (see `CaptureUseCase.classicalThreshold`). When ≥85% of the hole is already filled by temporal stitching, OpenCV Telea handles the rest; only large unfilled regions fall back to LaMa. Set the threshold higher to bias toward Telea, lower to bias toward LaMa.
 - Analyzer runs at ~1080x1920 resolution. The hi-res composite upscales the patched region into the full sensor capture (~2460x3280).
 - The ring buffer uses a static-scene skip (thumbnail diff) with a 1s heartbeat to avoid filling with redundant frames while still capturing clean-background samples during "user steps out of frame" periods.
 - `NativeSession.opLock` uses `tryLock()` in `pushFrame` to drop frames rather than block the analyzer when a capture is in progress.

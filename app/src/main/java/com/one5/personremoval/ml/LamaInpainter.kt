@@ -634,6 +634,12 @@ class LamaInpainter(
 
     private fun rgbBytesToBitmap(rgb: ByteArray, w: Int, h: Int): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        if (com.one5.personremoval.core.NativeSession.fillBitmapFromRgb(rgb, w, h, bmp)) {
+            return bmp
+        }
+        // Native fast path failed (wrong bitmap format / lock failure). Fall
+        // back to the original setPixels(IntArray) packer so the inpaint
+        // still completes — slower, but never silently produces a black bmp.
         val pixels = IntArray(w * h)
         for (i in 0 until w * h) {
             val r = rgb[i * 3].toInt() and 0xFF
@@ -646,6 +652,7 @@ class LamaInpainter(
     }
 
     private fun bitmapToRgbBytes(bmp: Bitmap): ByteArray {
+        com.one5.personremoval.core.NativeSession.readRgbFromBitmap(bmp)?.let { return it }
         val w = bmp.width; val h = bmp.height
         val pixels = IntArray(w * h)
         bmp.getPixels(pixels, 0, w, 0, 0, w, h)
