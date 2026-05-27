@@ -142,7 +142,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
         viewModelScope.launch(Dispatchers.Default) {
             cameraManager.frames.collectLatest { proxy ->
-                try {
+                proxy.use { proxy ->
                     if (_isProcessing.value) {
                         return@collectLatest
                     }
@@ -209,8 +209,6 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     _detection.value = raw.copy(persons = tracked)
                     _personStates.value = states
                     checkMotionRelock(rot)
-                } finally {
-                    proxy.close()
                 }
             }
         }
@@ -328,29 +326,13 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 }
 
                 val hiResBitmap = hiResDeferred.await()
-
-                val (jpeg, finalStatus) =
-                    if (hiResBitmap != null) {
-                        val tComp = System.currentTimeMillis()
-                        val composited = nativeSession.compositeHighRes(
-                            hiResBitmap,
-                            result.rgb, result.holeMask, result.width, result.height
-                        )
-                        val compMs = System.currentTimeMillis() - tComp
-                        if (composited != null) {
-                            Log.i("PRPipeline",
-                                "hi-res composite ${hiResBitmap.width}x${hiResBitmap.height} in ${compMs}ms")
-                            composited to "$status  +hi-res"
-                        } else {
-                            Log.w("PRPipeline", "hi-res composite returned null, falling back to low-res")
-                            val lo = nativeSession.encodeJpeg(result.rgb, result.width, result.height)
-                            lo to status
-                        }
-                    } else {
-                        val lo = nativeSession.encodeJpeg(result.rgb, result.width, result.height)
-                        lo to status
-                    }
-                hiResBitmap?.recycle()
+                if (hiResBitmap != null) {
+                    val stream = java.io.ByteArrayOutputStream()
+                    hiResBitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)
+                    GallerySaver.save(getApplication(), stream.toByteArray())
+                    hiResBitmap.recycle()
+                }
+                val jpeg = nativeSession.encodeJpeg(result.rgb, result.width, result.height)
 
                 if (jpeg == null) {
                     _toastEvents.tryEmit(ToastEvent("JPEG encode failed"))
@@ -359,8 +341,8 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 val uri = GallerySaver.save(getApplication(), jpeg)
                 val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
 
-                val isTricky = "tricky scene" in finalStatus
-                val keepSteady = "keep phone steady" in finalStatus
+                val isTricky = "tricky scene" in status
+                val keepSteady = "keep phone steady" in status
                 val toastMsg = when {
                     uri == null -> "Save failed"
                     keepSteady -> "Saved — keep phone steady, ask subject to step aside"
@@ -368,7 +350,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     else -> "Saved to Gallery"
                 }
                 _stitchPreview.value = bmp
-                _lastResultText.value = finalStatus
+                _lastResultText.value = status
                 _toastEvents.tryEmit(ToastEvent(toastMsg, long = isTricky || keepSteady))
             } finally {
                 nativeSession.frozen = false

@@ -1,20 +1,14 @@
 package com.one5.personremoval.ml
 
-import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
-import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Half
 import android.util.Log
 import java.io.File
 import java.io.IOException
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.nio.ShortBuffer
 import kotlin.math.max
 import kotlin.math.min
 
@@ -46,8 +40,7 @@ import kotlin.math.min
  */
 class LamaInpainter(
     context: Context,
-    private val modelAssetFp16: String = "lama_fp16.onnx",
-    private val modelAssetFp32: String = "lama.onnx",
+    private val modelAsset: String = "lama.onnx",
     private val workingSize: Int = 512
 ) : AutoCloseable {
 
@@ -67,30 +60,31 @@ class LamaInpainter(
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
 
-    // Detected dtypes from the loaded ONNX model. FP16 models require
-    // ShortBuffer + half-precision casts; FP32 models stay on FloatBuffer.
-    // Mixed-dtype models (FP32 input → FP16 output or vice versa) are
-    // handled because we detect each side independently.
-    private val inputDtype: OnnxJavaType
-    private val outputDtype: OnnxJavaType
-
     private var outputScale: Float? = null
 
+    private val cachedImgInputName: String
+    private val cachedMaskInputName: String
+    private val cachedOutputName: String
+
     init {
-        val modelCandidates = resolveModelCandidates(context)
-        session = createSession(modelCandidates)
+        val modelPath = ensureModelOnDisk(context, modelAsset)
+        session = createSession(listOf(modelPath))
 
-        val ins = session.inputInfo
-        val outs = session.outputInfo
+        val inputNames = session.inputNames.toList()
+        val outputNames = session.outputNames.toList()
+        if (INPUT_IMG in inputNames && INPUT_MASK in inputNames) {
+            cachedImgInputName = INPUT_IMG
+            cachedMaskInputName = INPUT_MASK
+        } else if (inputNames.size >= 2) {
+            cachedImgInputName = inputNames[0]
+            cachedMaskInputName = inputNames[1]
+        } else {
+            throw IllegalStateException("Unexpected LaMa input layout: $inputNames")
+        }
+        cachedOutputName = outputNames[0]
 
-        // Detect dtypes from the first input/output. Both LaMa inputs (image
-        // + mask) and the single output normally share the same dtype within
-        // one model file, so first-entry detection is sufficient.
-        inputDtype = (ins.values.first().info as? TensorInfo)?.type ?: OnnxJavaType.FLOAT
-        outputDtype = (outs.values.first().info as? TensorInfo)?.type ?: OnnxJavaType.FLOAT
-
-        Log.i(TAG, "LaMa loaded; inputs=${ins.keys} outputs=${outs.keys} " +
-                "inDtype=$inputDtype outDtype=$outputDtype workingSize=$workingSize")
+        Log.i(TAG, "LaMa loaded; inputs=$inputNames outputs=$outputNames " +
+                "workingSize=$workingSize")
     }
 
     private fun buildSessionOptions(useNnapi: Boolean, useXnnpack: Boolean):
@@ -149,19 +143,6 @@ class LamaInpainter(
         throw lastError ?: IllegalStateException("No model candidates")
     }
 
-    private fun resolveModelCandidates(context: Context): List<String> {
-        val candidates = mutableListOf<String>()
-        try {
-            context.assets.openFd(modelAssetFp16).close()
-            Log.i(TAG, "FP16 model found: $modelAssetFp16")
-            candidates.add(ensureModelOnDisk(context, modelAssetFp16))
-        } catch (_: IOException) {
-            Log.i(TAG, "FP16 model not found, skipping")
-        }
-        candidates.add(ensureModelOnDisk(context, modelAssetFp32))
-        return candidates
-    }
-
     /**
      * Stream the .onnx asset to internal storage if it's not already there, and
      * return the absolute path for ORT.
@@ -216,7 +197,7 @@ class LamaInpainter(
      * @param rgb    raw bytes, length = width*height*3 (channels-last)
      * @param mask   raw bytes, length = width*height (non-zero = inpaint)
      */
-    fun inpaint(rgb: ByteArray, mask: ByteArray, width: Int, height: Int): ByteArray {
+    fun inpaint(rgb: ByteArray, mask: ByteArray, width: Int, height: Int): ByteArray? {
         require(rgb.size >= width * height * 3) { "rgb too small" }
         require(mask.size >= width * height) { "mask too small" }
 
@@ -261,27 +242,13 @@ class LamaInpainter(
         val imgTensor = createInputTensor(imgBuf, longArrayOf(1, 3, h.toLong(), w.toLong()))
         val maskTensor = createInputTensor(maskBuf, longArrayOf(1, 1, h.toLong(), w.toLong()))
 
-        // 3. Run inference. Use the first input/output names from the session in case
-        //    Carve's export uses different naming than our defaults.
-        val inputNames = session.inputNames.toList()
-        val outputNames = session.outputNames.toList()
-        val inputs = mutableMapOf<String, OnnxTensor>()
-        // Heuristic: 4-channel single input means image+mask concatenated; most LaMa
-        // exports use two separate inputs. We pick by name if our defaults match,
-        // otherwise by position.
-        if (INPUT_IMG in inputNames && INPUT_MASK in inputNames) {
-            inputs[INPUT_IMG] = imgTensor
-            inputs[INPUT_MASK] = maskTensor
-        } else if (inputNames.size >= 2) {
-            inputs[inputNames[0]] = imgTensor
-            inputs[inputNames[1]] = maskTensor
-        } else {
-            imgTensor.close(); maskTensor.close()
-            throw IllegalStateException("Unexpected LaMa input layout: $inputNames")
-        }
+        val inputs = mapOf(
+            cachedImgInputName to imgTensor,
+            cachedMaskInputName to maskTensor
+        )
 
         val t0 = System.currentTimeMillis()
-        val result = session.run(inputs, setOf(outputNames[0]))
+        val result = session.run(inputs, setOf(cachedOutputName))
         val ms = System.currentTimeMillis() - t0
 
         val outTensor = result.get(0) as OnnxTensor
@@ -303,10 +270,15 @@ class LamaInpainter(
                 if (v < mn) mn = v
                 if (v > mx) mx = v
             }
+            Log.i(TAG, "output stats: min=$mn max=$mx nan=$nanCount → " +
+                    "samples=[${outArr[0]}, ${outArr[w * h / 2]}, ${outArr[w * h - 1]}]")
+            if (mx == Float.NEGATIVE_INFINITY || nanCount > outArr.size / 2) {
+                Log.e(TAG, "LaMa output degenerate (all-NaN or >50% NaN), bailing out")
+                return null
+            }
             val scale = if (mx <= 2.0f) 255f else 1f
             outputScale = scale
-            Log.i(TAG, "output stats: min=$mn max=$mx nan=$nanCount → scale=$scale " +
-                    "samples=[${outArr[0]}, ${outArr[w * h / 2]}, ${outArr[w * h - 1]}]")
+            Log.i(TAG, "output scale=$scale")
         }
         val scale = outputScale ?: 1f
 
@@ -369,7 +341,8 @@ class LamaInpainter(
         width: Int,
         height: Int,
         paddingPx: Int = 60,
-        minPixels: Int = 30
+        minPixels: Int = 30,
+        maxLamaCalls: Int = 3
     ): ByteArray {
         require(rgb.size >= width * height * 3) { "rgb too small" }
         require(mask.size >= width * height) { "mask too small" }
@@ -382,6 +355,7 @@ class LamaInpainter(
 
         Log.i(TAG, "inpaintGaps: ${components.size} component(s) in ${width}x${height}")
         val result = rgb.copyOf()
+        var lamaCalls = 0
 
         for ((idx, comp) in components.withIndex()) {
             val compW = comp.right - comp.left
@@ -414,21 +388,13 @@ class LamaInpainter(
             Log.i(TAG, "inpaintGaps: component $idx bbox=(${comp.left},${comp.top})-" +
                     "(${comp.right},${comp.bottom}) crop=${cw}x${ch}")
 
-            // Per-tile branch: when the crop is much larger than LaMa's
-            // 512×512 working size, downscaling the whole crop loses
-            // detail (3× downscale at crop=1500 → soft patch). Split into
-            // 2×2 overlapping tiles instead so each tile runs at near-
-            // native res and gets feather-blended at the seams.
-            //
-            // Threshold 768 keeps small/medium crops on the cheap single-
-            // pass path (one LaMa call); only the worst cases pay the 4×
-            // cost. The 0.25 overlap fraction gives enough seam-blend
-            // ribbon for cosine-tapered weighting to be smooth.
-            val inpainted = if (maxOf(cw, ch) > LARGE_CROP_THRESHOLD) {
-                inpaintLargeCrop(cropRgb, cropMask, cw, ch)
-            } else {
-                inpaint(cropRgb, cropMask, cw, ch)
+            if (lamaCalls >= maxLamaCalls) {
+                Log.i(TAG, "inpaintGaps: LaMa call cap ($maxLamaCalls) reached, skipping remaining")
+                break
             }
+
+            val inpainted = inpaint(cropRgb, cropMask, cw, ch) ?: continue
+            lamaCalls++
 
             for (y in 0 until ch) {
                 val srcRow = y * cw
@@ -505,6 +471,7 @@ class LamaInpainter(
             }
 
             val tInpainted = inpaint(tileRgb, tileMask, tw, th)
+                ?: continue
             // Accumulate weighted into crop-space.
             for (y in 0 until th) {
                 val tileRowBase = y * tw
@@ -573,63 +540,15 @@ class LamaInpainter(
 
     // -------------------------- helpers --------------------------- //
 
-    /**
-     * Build an OnnxTensor matching the loaded model's input dtype. FP16
-     * models accept ShortBuffer (each short = half-precision bit pattern);
-     * FP32 models accept the underlying FloatBuffer directly.
-     *
-     * FloatBuffer is consumed up to its current position when wrapped, so we
-     * pass it as-is when its capacity matches expected size. For FP16, we
-     * cast every element via android.util.Half (API 26+).
-     */
     private fun createInputTensor(srcFloats: FloatBuffer, shape: LongArray): OnnxTensor {
-        return when (inputDtype) {
-            OnnxJavaType.FLOAT -> OnnxTensor.createTensor(env, srcFloats, shape)
-            OnnxJavaType.FLOAT16 -> {
-                // ORT 1.18 Java doesn't accept ShortBuffer for FP16 via the
-                // typed overload; pack halves into a direct ByteBuffer
-                // (native order) and pass via the (Buffer, shape, type) form.
-                val n = srcFloats.capacity()
-                val arr = srcFloats.array()
-                val bb = ByteBuffer.allocateDirect(n * 2).order(ByteOrder.nativeOrder())
-                val sb = bb.asShortBuffer()
-                for (i in 0 until n) sb.put(i, Half.toHalf(arr[i]))
-                OnnxTensor.createTensor(env, bb, shape, OnnxJavaType.FLOAT16)
-            }
-            else -> throw IllegalStateException(
-                    "Unsupported LaMa input dtype: $inputDtype")
-        }
+        return OnnxTensor.createTensor(env, srcFloats, shape)
     }
 
-    /**
-     * Read a model output tensor into a flat FloatArray, expanding FP16
-     * halves to floats when needed. Channel-first packing [1, C, H, W] is
-     * preserved — caller indexes the same way for both dtypes.
-     */
     private fun readOutputFloats(tensor: OnnxTensor, expectedSize: Int): FloatArray {
-        return when (outputDtype) {
-            OnnxJavaType.FLOAT -> {
-                val buf = tensor.floatBuffer
-                val out = FloatArray(expectedSize)
-                buf.get(out, 0, minOf(expectedSize, buf.remaining()))
-                out
-            }
-            OnnxJavaType.FLOAT16 -> {
-                // FP16 output is exposed via raw ByteBuffer. Each pair of
-                // little-endian bytes is a half-precision float bit pattern.
-                // Going through ByteBuffer (not getShortBuffer) avoids
-                // ORT-version differences in which dtypes the short-buffer
-                // accessor accepts.
-                val bb = tensor.byteBuffer.order(ByteOrder.nativeOrder())
-                val sb = bb.asShortBuffer()
-                val n = minOf(expectedSize, sb.remaining())
-                val out = FloatArray(expectedSize)
-                for (i in 0 until n) out[i] = Half.toFloat(sb.get(i))
-                out
-            }
-            else -> throw IllegalStateException(
-                    "Unsupported LaMa output dtype: $outputDtype")
-        }
+        val buf = tensor.floatBuffer
+        val out = FloatArray(expectedSize)
+        buf.get(out, 0, minOf(expectedSize, buf.remaining()))
+        return out
     }
 
     private fun rgbBytesToBitmap(rgb: ByteArray, w: Int, h: Int): Bitmap {

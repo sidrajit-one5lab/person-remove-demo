@@ -287,5 +287,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         @JvmStatic private external fun nativeHarmonizeLamaRegion(
             rgb: ByteArray, mask: ByteArray, width: Int, height: Int
         )
+        @JvmStatic external fun nativeDilateMask(
+            mask: ByteArray, w: Int, h: Int, radiusPx: Int
+        ): ByteArray
     }
 }

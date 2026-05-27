@@ -72,22 +72,10 @@ class CaptureUseCase(
         //      mask leak at hair/feet) is no longer needed.
         //   2. Fallback path: binary YOLO mask OR'd across REMOVE persons,
         //      plus bbox-floor for bbox area > 25% of frame.
-        val refiner = mattingRefiner
-        val canMatte = refiner != null && refiner.isAvailable &&
-                referenceRgba != null && referenceRgba.size >= w * h * 4
-        val removeMask = if (canMatte) {
-            val rgb = nativeSession.rgbaToRgb(referenceRgba!!, w, h)
-                ?: rgbaToRgb(referenceRgba, w, h)
-            val alpha = refiner!!.refineRemoveMask(rgb, w, h, removePersons)
-            val out = ByteArray(w * h)
-            for (i in 0 until w * h) {
-                if ((alpha[i].toInt() and 0xFF) >= 128) out[i] = 1
-            }
-            applyBboxFloor(out, removePersons, w, h)
-            out
-        } else {
-            buildBinaryRemoveMaskWithBboxFloor(removePersons, w, h)
-        }
+        // MODNet disabled — YOLO mask improvements (bilinear upsample,
+        // adaptive threshold, edge snap, bbox pad) provide sufficient
+        // mask quality. Saves ~900ms per capture.
+        val removeMask = buildBinaryRemoveMaskWithBboxFloor(removePersons, w, h)
 
         val removeTrackIds = removePersons.map { it.trackId }.toIntArray()
 
@@ -102,8 +90,24 @@ class CaptureUseCase(
         val actualFill = 1f - actualUnfilled.toFloat() / holePx
 
         val classicalThreshold = 0.85f
+        val lamaBailThreshold = 0.70f
         val needsInpaint = actualUnfilled > 0
-        val useLama = actualFill < classicalThreshold
+        val useLama = actualFill in lamaBailThreshold..< classicalThreshold
+
+        // Early bail: if less than 50% filled, LaMa will hallucinate on a
+        // massive hole — skip AI inpaint entirely, return the stitch as-is
+        // with a retry hint. Better than waiting 60s for bad output.
+        if (actualFill < lamaBailThreshold) {
+            val totalMs = System.currentTimeMillis() - t0
+            Log.w(TAG, "pipeline bail: fill=%.2f < %.2f, skipping inpaint (${totalMs}ms)"
+                .format(actualFill, lamaBailThreshold))
+            return PipelineResult(
+                rgb = stitch.rgb,
+                width = stitch.width,
+                height = stitch.height,
+                holeMask = stitch.fullHoleMask
+            ) to "not enough background — move camera around the subject before capturing"
+        }
 
         val filledRgb: ByteArray
         val inpaintMethod: String
@@ -181,7 +185,7 @@ class CaptureUseCase(
     }
 
     private fun applyBboxFloor(mask: ByteArray, persons: List<Person>, w: Int, h: Int) {
-        val threshold = (w.toLong() * h * 0.25).toInt()
+        val threshold = (w.toLong() * h * 0.40).toInt()
         for (p in persons) {
             val xMin = p.bBox.left.toInt().coerceAtLeast(0)
             val yMin = p.bBox.top.toInt().coerceAtLeast(0)
@@ -202,7 +206,7 @@ class CaptureUseCase(
         w: Int,
         h: Int
     ): ByteArray {
-        val bboxFloorAreaThreshold = (w.toLong() * h * 0.25).toInt()
+        val bboxFloorAreaThreshold = (w.toLong() * h * 0.40).toInt()
         val removeMask = ByteArray(w * h)
         for (p in removePersons) {
             if (p.maskWidth != w || p.maskHeight != h || p.mask.size < w * h) continue

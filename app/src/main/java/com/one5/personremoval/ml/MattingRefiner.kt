@@ -6,7 +6,6 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.TensorInfo
 import android.content.Context
-import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Rect
@@ -19,7 +18,7 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.nio.ShortBuffer
+import androidx.core.graphics.scale
 
 /**
  * Alpha-matting refiner backed by a MODNet ONNX model (via ONNX Runtime).
@@ -142,7 +141,7 @@ class MattingRefiner(
             Rect(0, 0, bbox.width(), bbox.height()),
             null
         )
-        val resized = Bitmap.createScaledBitmap(cropBmp, workingSize, workingSize, true)
+        val resized = cropBmp.scale(workingSize, workingSize)
         cropBmp.recycle()
 
         return try {

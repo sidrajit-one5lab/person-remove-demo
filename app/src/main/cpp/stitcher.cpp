@@ -60,7 +60,7 @@ StitchResult stitch(
     // Per-frame "is high quality" flag, computed once outside the per-pixel
     // loop. Threshold 0.6 corresponds to ~0.67 px mean reprojection error;
     // matches the noise floor at the current detect scale.
-    constexpr float kHiQualityCutoff = 0.6f;
+    constexpr float kHiQualityCutoff = 0.4f;
     std::vector<uint8_t> isHiQuality(numFrames, 0);
     for (size_t fi = 0; fi < numFrames; ++fi) {
         isHiQuality[fi] = (aligned[fi].quality >= kHiQualityCutoff) ? 1 : 0;
@@ -82,7 +82,7 @@ StitchResult stitch(
     //   1–2     → yellow (marginal, alignment artifacts likely)
     //   3–9     → green  (solid)
     //   10+     → green  (high confidence)
-    int hist0 = 0, hist12 = 0, hist39 = 0, hist10p = 0;
+    int hist0 = 0, hist14 = 0, hist59 = 0, hist10p = 0;
 
     for (int y = 0; y < H; ++y) {
         const auto* holeRow = holeMask.ptr<uchar>(y);
@@ -133,7 +133,7 @@ StitchResult stitch(
             // here; otherwise use everything to keep coverage on sparse
             // captures. Both buckets are local references so downstream
             // medianInPlace operates on the chosen vector in place.
-            constexpr int kHiPreferThreshold = 3;
+            constexpr int kHiPreferThreshold = 5;
             std::vector<uchar>& rs =
                     (rsHi.size() >= kHiPreferThreshold) ? rsHi : rsAll;
             std::vector<uchar>& gs =
@@ -145,8 +145,8 @@ StitchResult stitch(
             countRow[x] = static_cast<uchar>(std::min(n, 255));
 
             if (n == 0) ++hist0;
-            else if (n <= 2) ++hist12;
-            else if (n <= 9) ++hist39;
+            else if (n <= 4) ++hist14;
+            else if (n <= 9) ++hist59;
             else ++hist10p;
 
             // Adaptive routing: pixels with fewer than 3 samples have high
@@ -165,7 +165,7 @@ StitchResult stitch(
             // pixels), this branch is rarely taken — no behavior change.
             // On sparse captures it's the difference between "patchy bad
             // median" and "consistent LaMa fill."
-            constexpr int kMinReliableSamples = 3;
+            constexpr int kMinReliableSamples = 5;
             if (n < kMinReliableSamples) {
                 unfilledRow[x] = 255;
                 if (n > 0) {
@@ -197,8 +197,8 @@ StitchResult stitch(
     LOGI("stitch: holePx=%d filledWithRealBg=%d unfilled=%d ratio=%.2f noSample=%.2f",
          totalHole, filled, totalHole - filled,
          result.realFillRatio, result.noSampleRatio);
-    LOGI("stitch confidence: 0:%d  1-2:%d  3-9:%d  10+:%d",
-         hist0, hist12, hist39, hist10p);
+    LOGI("stitch confidence: 0:%d  1-4:%d  5-9:%d  10+:%d",
+         hist0, hist14, hist59, hist10p);
 
     return result;
 }
@@ -449,7 +449,9 @@ void matchNoiseToReferenceSurround(
 
 void detectGhostPixels(
         const cv::Mat& stitched,
+        const cv::Mat& reference,
         const cv::Mat& holeMask,
+        const cv::Mat& personMask,
         cv::Mat& unfilled,
         const cv::Mat& sampleCount) {
     if (stitched.empty() || holeMask.empty() || unfilled.empty()) return;
@@ -460,33 +462,75 @@ void detectGhostPixels(
     cv::subtract(dilated, holeMask, outerRing);
     if (cv::countNonZero(outerRing) < 200) return;
 
-    cv::Mat gray;
-    cv::cvtColor(stitched, gray, cv::COLOR_RGB2GRAY);
+    cv::Mat stitchGray;
+    cv::cvtColor(stitched, stitchGray, cv::COLOR_RGB2GRAY);
     cv::Scalar bandMean, bandStddev;
-    cv::meanStdDev(gray, bandMean, bandStddev, outerRing);
+    cv::meanStdDev(stitchGray, bandMean, bandStddev, outerRing);
 
-    const auto refMean = static_cast<float>(bandMean[0]);
-    const auto refStd  = static_cast<float>(bandStddev[0]);
-    const float limit   = std::max(50.0f, refStd * 3.0f);
+    const auto outerMean = static_cast<float>(bandMean[0]);
+    const auto outerStd  = static_cast<float>(bandStddev[0]);
+    const float outerLimit = std::max(50.0f, outerStd * 3.0f);
 
-    int flagged = 0;
-    const int H = gray.rows, W = gray.cols;
+    const bool haveSampleCount = !sampleCount.empty() &&
+            sampleCount.size() == stitchGray.size() &&
+            sampleCount.type() == CV_8UC1;
+
+    // Reference-similarity ghost detection: if a stitched pixel where the
+    // person ACTUALLY IS (undilated personMask) looks very similar to the
+    // reference frame, the temporal median reproduced the person instead of
+    // finding background. Only checked inside personMask — the dilation
+    // margin is background in both stitch and reference, so similarity
+    // there is expected and correct.
+    cv::Mat refGray;
+    const bool haveRef = !reference.empty() &&
+            reference.size() == stitched.size();
+    if (haveRef) {
+        cv::cvtColor(reference, refGray, cv::COLOR_RGB2GRAY);
+    }
+    const bool havePersonMask = !personMask.empty() &&
+            personMask.size() == stitchGray.size() &&
+            personMask.type() == CV_8UC1;
+    constexpr float kRefSimilarityLimit = 25.0f;
+
+    int flaggedOuter = 0, flaggedRef = 0;
+    const int H = stitchGray.rows, W = stitchGray.cols;
     for (int y = 0; y < H; ++y) {
-        const uchar* gRow = gray.ptr<uchar>(y);
-        const auto* hRow = holeMask.ptr<uchar>(y);
-        auto*       uRow = unfilled.ptr<uchar>(y);
+        const uchar* sGray  = stitchGray.ptr<uchar>(y);
+        const auto*  hRow   = holeMask.ptr<uchar>(y);
+        auto*        uRow   = unfilled.ptr<uchar>(y);
+        const uchar* scRow  = haveSampleCount ? sampleCount.ptr<uchar>(y) : nullptr;
+        const uchar* rGray  = haveRef ? refGray.ptr<uchar>(y) : nullptr;
+        const uchar* pRow   = havePersonMask ? personMask.ptr<uchar>(y) : nullptr;
         for (int x = 0; x < W; ++x) {
             if (hRow[x] == 0) continue;
             if (uRow[x] != 0) continue;
-            float diff = std::abs(static_cast<float>(gRow[x]) - refMean);
-            if (diff > limit) {
-                uRow[x] = 255;
-                ++flagged;
+
+            // Low-sample pixels: check against outer-ring mean (original logic)
+            if (!scRow || scRow[x] < 3) {
+                float diff = std::abs(static_cast<float>(sGray[x]) - outerMean);
+                if (diff > outerLimit) {
+                    uRow[x] = 255;
+                    ++flaggedOuter;
+                }
+                continue;
+            }
+
+            // High-sample pixels inside the person body: if stitch ≈ reference,
+            // the median picked up the person, not background.
+            if (rGray && pRow && pRow[x] != 0) {
+                float refDiff = std::abs(static_cast<float>(sGray[x]) -
+                                         static_cast<float>(rGray[x]));
+                if (refDiff < kRefSimilarityLimit) {
+                    uRow[x] = 255;
+                    ++flaggedRef;
+                }
             }
         }
     }
-    LOGI("ghostDetect: flagged %d pixels (refMean=%.0f refStd=%.1f limit=%.1f)",
-         flagged, refMean, refStd, limit);
+    LOGI("ghostDetect: flaggedOuter=%d flaggedRef=%d (outerMean=%.0f "
+         "outerStd=%.1f limit=%.1f refCompare=%s personMask=%s)",
+         flaggedOuter, flaggedRef, outerMean, outerStd, outerLimit,
+         haveRef ? "yes" : "no", havePersonMask ? "yes" : "no");
 }
 
 // ----------------------------------------------------------------------------

@@ -214,7 +214,7 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
             cv::resize(gray, thumb, cv::Size(32, 24), 0, 0, cv::INTER_AREA);
             cv::Mat diff;
             cv::absdiff(thumb, s->lastThumb, diff);
-            if (cv::mean(diff)[0] < 15.0) {
+            if (cv::mean(diff)[0] < 6.0) {
                 LOGI("pushFrame: detection miss guard — prev coverage %.1f%% "
                      "but current 0%%, scene unchanged, skipping",
                      s->lastPersonCoverage * 100);
@@ -222,6 +222,17 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
             }
         }
         s->lastPersonCoverage = coverage;
+    }
+
+    // Rate gate: cap ingest at ~10 fps during active scenes. Without this,
+    // fast YOLO cycles flood the buffer with near-identical frames and evict
+    // older parallax-diverse samples.
+    {
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (s->lastPushMs > 0 && nowMs - s->lastPushMs < 100) {
+            return;
+        }
     }
 
     // Static-scene skip + heartbeat: compare a 32×24 grayscale thumbnail of
@@ -244,20 +255,13 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
             cv::Mat diff;
             cv::absdiff(thumb, s->lastThumb, diff);
             const double meanDiff = cv::mean(diff)[0];
-            // ~3/255 = scene is essentially the same. Sensor noise alone runs
-            // ~1–2 on a still subject, so 3 is a gentle floor.
-            //
-            // Heartbeat: even on a perfectly still scene we push a frame
-            // every 500 ms so the smaller (30-frame) buffer still covers a
-            // useful real-time window during "leave and come back" workflows.
-            // (Previously 1000 ms when the buffer was 80 frames deep.)
             const bool scenedStill = (meanDiff < 3.0);
             const bool recentPush = (nowMs - s->lastPushMs < 500);
             if (scenedStill && recentPush) {
-                return;  // skip push
+                return;
             }
         }
-        s->lastThumb = thumb;       // owns its own buffer (cv::resize allocates)
+        s->lastThumb = thumb;
         s->lastPushMs = nowMs;
         f.thumbnail = thumb.clone();
     }
@@ -335,8 +339,15 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         LOGI("stitchForInpaint: buffer empty");
         return false;
     }
-    BufferedFrame reference = std::move(snap.back());
-    snap.pop_back();
+    // Find the newest frame by timestamp — content-based eviction can place
+    // it at any slot, so snap.back() is NOT reliable as the reference.
+    size_t newestIdx = 0;
+    for (size_t i = 1; i < snap.size(); ++i) {
+        if (snap[i].timestampMs > snap[newestIdx].timestampMs)
+            newestIdx = i;
+    }
+    BufferedFrame reference = std::move(snap[newestIdx]);
+    snap.erase(snap.begin() + static_cast<std::ptrdiff_t>(newestIdx));
 
     // The REMOVE mask must match the reference frame size. If not, the caller's
     // detection is stale (frame size changed mid-capture) — fail rather than warp.
@@ -476,8 +487,11 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     auto t1 = clk::now();
     auto result = stitch(reference, dilatedHole, aligned);
 
-    detectGhostPixels(result.image, dilatedHole, result.stillUnfilled,
-                      result.sampleCount);
+    // Ghost detector disabled. The detection-miss guard in pushFrame
+    // prevents the primary ghost source (YOLO detection drops). The
+    // ref-similarity check false-positives on background pixels whose
+    // luminance naturally matches the person → forces unnecessary LaMa
+    // → produces worse artifacts than the ghosts it was meant to catch.
 
     auto t2 = clk::now();
 
@@ -840,7 +854,7 @@ Java_com_one5_personremoval_core_NativeSession_nativeCompositeHighRes(
     // ---- 3. Upscale low-res stitched + mask to high-res dimensions. -------
     cv::Mat upStitched, upMask;
     cv::resize(lowBgr,  upStitched, highRes.size(), 0, 0, cv::INTER_CUBIC);
-    cv::resize(lowMask, upMask,     highRes.size(), 0, 0, cv::INTER_LINEAR);
+    cv::resize(lowMask, upMask,     highRes.size(), 0, 0, cv::INTER_NEAREST);
     cv::threshold(upMask, upMask, 127, 255, cv::THRESH_BINARY);
 
     env->ReleaseByteArrayElements(lowResStitched, lowStPtr, JNI_ABORT);
@@ -1218,6 +1232,33 @@ Java_com_one5_personremoval_core_NativeSession_nativeReadRgbFromBitmap(
     if (!out) return nullptr;
     env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgbLen),
                             reinterpret_cast<const jbyte*>(rgbMat.data));
+    return out;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeDilateMask(
+        JNIEnv* env, jclass /*clazz*/,
+        jbyteArray mask, jint w, jint h, jint radiusPx) {
+    if (w <= 0 || h <= 0 || radiusPx <= 0) return mask;
+    const size_t len = static_cast<size_t>(w) * h;
+    if (env->GetArrayLength(mask) < (jsize)len) return mask;
+
+    jbyte* ptr = env->GetByteArrayElements(mask, nullptr);
+    if (!ptr) return mask;
+    cv::Mat src(h, w, CV_8UC1, ptr);
+    cv::Mat bin;
+    cv::threshold(src, bin, 0, 255, cv::THRESH_BINARY);
+    env->ReleaseByteArrayElements(mask, ptr, JNI_ABORT);
+
+    int kernSz = radiusPx * 2 + 1;
+    cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kernSz, kernSz));
+    cv::Mat dilated;
+    cv::dilate(bin, dilated, kern);
+
+    jbyteArray out = env->NewByteArray(static_cast<jsize>(len));
+    if (!out) return mask;
+    env->SetByteArrayRegion(out, 0, static_cast<jsize>(len),
+                            reinterpret_cast<const jbyte*>(dilated.data));
     return out;
 }
 

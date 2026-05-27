@@ -27,3 +27,4 @@ local.properties
 /tmp/
 __pycache__/
 *.pyc
+/AGENTS.md

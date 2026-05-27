@@ -13,7 +13,7 @@
 namespace {
 
 constexpr int   kOrbFeatures     = 1000;
-constexpr int   kMinGoodMatches  = 8;
+constexpr int   kMinGoodMatches  = 15;
 constexpr float kRansacReproj    = 3.0f;
 // MORPH_RECT: OpenCV decomposes into separable 1D horizontal + vertical
 // passes → O(w+h) per pixel instead of O(w×h) for MORPH_ELLIPSE. ~60×
@@ -69,7 +69,7 @@ std::vector<AlignedFrame> alignToReference(
     // Pre-dilate reference person mask by a moderate kernel to avoid boundary keypoint leakage
     cv::Mat dilatedRefPersonMask;
     if (!reference.anyPersonMask.empty()) {
-        cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(151, 151));
+        cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(41, 41));
         cv::dilate(reference.anyPersonMask, dilatedRefPersonMask, kern);
     } else {
         dilatedRefPersonMask = reference.anyPersonMask;
@@ -208,8 +208,8 @@ std::vector<AlignedFrame> alignToReference(
                 }
                 cv::Mat candMaskDetect;
                 if (!candMaskFull.empty() && detectScale > 1) {
-                    cv::resize(candMaskFull, candMaskDetect, detectSize, 0, 0, cv::INTER_LINEAR);
-                    cv::threshold(candMaskDetect, candMaskDetect, 240, 255, cv::THRESH_BINARY);
+                    cv::resize(candMaskFull, candMaskDetect, detectSize, 0, 0, cv::INTER_NEAREST);
+                    cv::threshold(candMaskDetect, candMaskDetect, 128, 255, cv::THRESH_BINARY);
                 } else {
                     candMaskDetect = candMaskFull;
                 }
@@ -277,7 +277,11 @@ std::vector<AlignedFrame> alignToReference(
                     // still beats no alignment.
                     if (!reference.rotation.empty() && !f.rotation.empty()) {
                         cv::Mat Rrel = reference.rotation.t() * f.rotation;
-                        const auto fLen = static_cast<double>(
+                        // Approximate focal length in pixels. Typical phone
+                        // cameras have ~70-80° horizontal FOV → f ≈ 0.85 × max(W,H).
+                        // max(W,H) alone overestimates by ~15-20%, under-rotating
+                        // the gyro homography.
+                        const auto fLen = 0.85 * static_cast<double>(
                                 std::max(refSize.width, refSize.height));
                         const double cx = refSize.width * 0.5;
                         const double cy = refSize.height * 0.5;
@@ -301,7 +305,7 @@ std::vector<AlignedFrame> alignToReference(
                         const double dx = cDst[0].x - cSrc[0].x;
                         const double dy = cDst[0].y - cSrc[0].y;
                         const double tr = std::sqrt(dx * dx + dy * dy);
-                        const double trLimit = refSize.width * 0.18;
+                        const double trLimit = refSize.width * 0.08;
                         if (tr > trLimit) {
                             LOGD("aligner: gyro tier-0 rejected — center shift %.1f px "
                                  "(limit %.1f)", tr, trLimit);
@@ -375,7 +379,7 @@ std::vector<AlignedFrame> alignToReference(
                         ++counted;
                     }
                     meanReprojError = (counted > 0) ? (sumError / counted) : 999.0;
-                    if (meanReprojError > 3.0) {
+                    if (meanReprojError > 2.0) {
                         LOGD("aligner: rejecting H with mean reproj error %.2f px "
                              "(inliers=%d)", meanReprojError, counted);
                         works[fi] = w;
@@ -397,11 +401,38 @@ std::vector<AlignedFrame> alignToReference(
                     const double dx = centerDst[0].x - centerSrc[0].x;
                     const double dy = centerDst[0].y - centerSrc[0].y;
                     const double translation = std::sqrt(dx * dx + dy * dy);
-                    const double translationLimit = refSize.width * 0.18;
+                    const double translationLimit = refSize.width * 0.08;
                     if (translation > translationLimit) {
                         LOGD("aligner: rejecting frame with center shift %.1f px "
                              "(limit %.1f) — too much parallax risk",
                              translation, translationLimit);
+                        works[fi] = w;
+                        continue;
+                    }
+                }
+
+                // Corner-displacement gate: center check passes for warps
+                // that rotate/skew the frame while holding the center fixed.
+                // Warp all 4 corners and reject if any moves too far.
+                {
+                    const float fw = static_cast<float>(refSize.width);
+                    const float fh = static_cast<float>(refSize.height);
+                    std::vector<cv::Point2f> corners = {
+                        {0, 0}, {fw, 0}, {fw, fh}, {0, fh}
+                    };
+                    std::vector<cv::Point2f> warped;
+                    cv::perspectiveTransform(corners, warped, H);
+                    double maxCornerDisp = 0.0;
+                    for (int c = 0; c < 4; ++c) {
+                        const double cdx = warped[c].x - corners[c].x;
+                        const double cdy = warped[c].y - corners[c].y;
+                        maxCornerDisp = std::max(maxCornerDisp,
+                                                 std::sqrt(cdx * cdx + cdy * cdy));
+                    }
+                    const double cornerLimit = fw * 0.12;
+                    if (maxCornerDisp > cornerLimit) {
+                        LOGD("aligner: rejecting H with max corner disp %.1f px "
+                             "(limit %.1f)", maxCornerDisp, cornerLimit);
                         works[fi] = w;
                         continue;
                     }
@@ -433,18 +464,27 @@ std::vector<AlignedFrame> alignToReference(
                     try {
                         cv::TermCriteria criteria(
                                 cv::TermCriteria::EPS | cv::TermCriteria::COUNT,
-                                /*maxCount=*/5, /*epsilon=*/0.001);
+                                /*maxCount=*/25, /*epsilon=*/1e-4);
                         cv::findTransformECC(refGrayDetect, grayDetect, Hdown,
                                              cv::MOTION_HOMOGRAPHY, criteria, eccMask, 5);
 
                         Hdown.convertTo(Hdown, CV_64F);
-                        if (detectScale > 1) {
-                            Hdown.at<double>(0, 2) *= s;
-                            Hdown.at<double>(1, 2) *= s;
-                            Hdown.at<double>(2, 0) /= s;
-                            Hdown.at<double>(2, 1) /= s;
+                        double eccDet = cv::determinant(Hdown);
+                        bool eccOk = std::isfinite(eccDet) &&
+                                     eccDet > 0.1 && eccDet < 10.0;
+                        for (int r = 0; r < 3 && eccOk; ++r)
+                            for (int c = 0; c < 3 && eccOk; ++c)
+                                if (!std::isfinite(Hdown.at<double>(r, c)))
+                                    eccOk = false;
+                        if (eccOk) {
+                            if (detectScale > 1) {
+                                Hdown.at<double>(0, 2) *= s;
+                                Hdown.at<double>(1, 2) *= s;
+                                Hdown.at<double>(2, 0) /= s;
+                                Hdown.at<double>(2, 1) /= s;
+                            }
+                            H = Hdown;
                         }
-                        H = Hdown;
                     } catch (const cv::Exception&) {
                         // Keep the RANSAC H; it already passed all gates.
                     }

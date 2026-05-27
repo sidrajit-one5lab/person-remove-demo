@@ -109,11 +109,10 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
         }
 
         detection?.let { d ->
-            val removeCount = personStates.count { it.value == com.one5.personremoval.core.PersonState.REMOVE }
-            val cam = if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "back"
+//            val removeCount = personStates.count { it.value == com.one5.personremoval.core.PersonState.REMOVE }
+//            val cam = if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "back"
             Text(
-                text = "$cam   persons: ${d.persons.size}   remove: $removeCount   " +
-                        "${d.inferenceMs} ms   buf: $bufSize/45",
+                text = "${d.inferenceMs} ms   buf: $bufSize/45",
                 color = Color.White,
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -147,11 +146,20 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
             )
         }
 
+        Text(
+            text = "Keep phone steady for better results",
+            color = Color.White.copy(alpha = 0.7f),
+            fontSize = 12.sp,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 100.dp)
+        )
+
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 32.dp),
+                .padding(horizontal = 16.dp, vertical = 50.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             Button(

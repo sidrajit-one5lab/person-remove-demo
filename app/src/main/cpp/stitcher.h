@@ -157,7 +157,9 @@ void matchNoiseToReferenceSurround(
  */
 void detectGhostPixels(
         const cv::Mat& stitched,
+        const cv::Mat& reference,
         const cv::Mat& holeMask,
+        const cv::Mat& personMask,
         cv::Mat& unfilled,
         const cv::Mat& sampleCount);
 
@@ -167,9 +169,8 @@ void detectGhostPixels(
  * For each pixel inside [holeMask]:
  *   collect samples from every valid AlignedFrame where that pixel was NOT covered
  *   by a person mask (i.e. real background).
- *   - 0 samples → mark stillUnfilled
- *   - 1 sample  → use it directly
- *   - 2+        → channel-wise median
+ *   - 0–4 samples → mark stillUnfilled (too few for reliable median)
+ *   - 5+          → channel-wise median (prefers hi-quality frames when ≥5 available)
  *
  * Pixels outside the hole are copied verbatim from [reference].
  *

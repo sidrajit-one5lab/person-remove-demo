@@ -1,5 +1,6 @@
 #include "buffer.h"
 #include <opencv2/imgproc.hpp>
+#include <algorithm>
 
 RingBuffer::RingBuffer(size_t capacity) : capacity_(capacity) {
     buf_.reserve(capacity);
@@ -17,13 +18,20 @@ void RingBuffer::push(BufferedFrame&& f) {
     if (buf_.size() < capacity_) {
         buf_.push_back(std::move(f));
     } else {
-        // Evict the frame most similar to its predecessor (lowest diversity
-        // contribution). Scan is O(capacity) with 32x24 diffs — microseconds.
-        size_t evictIdx = head_;  // default: oldest (FIFO fallback)
+        // Evict the frame most similar to its temporal neighbor (lowest
+        // diversity contribution). Sort indices by timestamp so we compare
+        // chronologically adjacent frames, not arbitrary buffer slots.
+        std::vector<size_t> byTime(capacity_);
+        for (size_t i = 0; i < capacity_; ++i) byTime[i] = i;
+        std::sort(byTime.begin(), byTime.end(), [&](size_t a, size_t b) {
+            return buf_[a].timestampMs < buf_[b].timestampMs;
+        });
+
+        size_t evictIdx = byTime[0]; // default: oldest (FIFO fallback)
         double minDiff = 1e9;
-        for (size_t i = 0; i < capacity_; ++i) {
-            size_t cur = (head_ + i) % capacity_;
-            size_t prev = (head_ + i + capacity_ - 1) % capacity_;
+        for (size_t i = 1; i < capacity_; ++i) {
+            size_t cur  = byTime[i];
+            size_t prev = byTime[i - 1];
             if (buf_[cur].thumbnail.empty() || buf_[prev].thumbnail.empty()) continue;
             cv::Mat diff;
             cv::absdiff(buf_[cur].thumbnail, buf_[prev].thumbnail, diff);
@@ -34,9 +42,6 @@ void RingBuffer::push(BufferedFrame&& f) {
             }
         }
         buf_[evictIdx] = std::move(f);
-        // head_ stays at the oldest logical position; eviction is content-based
-        // so chronological ordering may have a gap, but snapshot still returns
-        // all frames and the stitcher doesn't depend on ordering.
     }
 }
 

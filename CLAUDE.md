@@ -17,7 +17,7 @@ PersonRemoval is an Android app that removes people from photos in real-time. Th
 
 The project targets **arm64-v8a only** (NDK ABI filter). It will not build native code for x86/x86_64 emulators — use a physical arm64 device or an arm64 emulator image.
 
-The app requires `android:largeHeap="true"` — the ring buffer holds up to 80 frames at ~4 MB each (~320 MB peak; rarely full).
+The app requires `android:largeHeap="true"` — the ring buffer holds up to 45 frames at ~4 MB each (~180 MB peak).
 
 ## Project Structure
 

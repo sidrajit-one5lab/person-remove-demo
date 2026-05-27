@@ -49,7 +49,7 @@ class YoloSegmenter(
         private external fun nativeFillInputBuffer(
             rgba: ByteArray, srcW: Int, srcH: Int,
             dstW: Int, dstH: Int, padX: Int, padY: Int,
-            inputBuffer: java.nio.ByteBuffer, isFloat32: Boolean
+            inputBuffer: ByteBuffer, isFloat32: Boolean
         )
 
         private const val TAG = "YoloSegmenter"
@@ -61,8 +61,10 @@ class YoloSegmenter(
         // Adaptive threshold range: low-confidence detections (0.3) → 0.20
         // (aggressive, catches soft edges), high-confidence (0.9) → 0.38
         // (tight, less background puff).
-        private const val MASK_THRESH_MIN = 0.15f
-        private const val MASK_THRESH_MAX = 0.40f
+        private const val MASK_THRESH_MIN = 0.12f
+        private const val MASK_THRESH_MAX = 0.30f
+        private const val BBOX_MASK_PAD = 0.05f
+        private const val EDGE_SNAP_FRAC = 0.03f
     }
 
     private val interpreter: Interpreter
@@ -233,10 +235,20 @@ class YoloSegmenter(
             val x2_640 = det.cx + det.w / 2f
             val y2_640 = det.cy + det.h / 2f
 
-            val x1 = ((x1_640 - padX) / scale).coerceIn(0f, width - 1f)
-            val y1 = ((y1_640 - padY) / scale).coerceIn(0f, height - 1f)
-            val x2 = ((x2_640 - padX) / scale).coerceIn(0f, width - 1f)
-            val y2 = ((y2_640 - padY) / scale).coerceIn(0f, height - 1f)
+            var x1 = ((x1_640 - padX) / scale).coerceIn(0f, width - 1f)
+            var y1 = ((y1_640 - padY) / scale).coerceIn(0f, height - 1f)
+            var x2 = ((x2_640 - padX) / scale).coerceIn(0f, width - 1f)
+            var y2 = ((y2_640 - padY) / scale).coerceIn(0f, height - 1f)
+
+            // Snap bbox to frame edge when close — YOLO often predicts slightly
+            // short of the boundary for persons cut off by the frame.
+            val edgeX = width * EDGE_SNAP_FRAC
+            val edgeY = height * EDGE_SNAP_FRAC
+            if (x1 < edgeX) x1 = 0f
+            if (y1 < edgeY) y1 = 0f
+            if (x2 > width - 1f - edgeX) x2 = width - 1f
+            if (y2 > height - 1f - edgeY) y2 = height - 1f
+
             val bbox = RectF(x1, y1, x2, y2)
 
             val mask = buildMask(det.coeffs, protos, bbox, width, height, scale, padX, padY, det.conf)
@@ -347,35 +359,78 @@ class YoloSegmenter(
         scale: Float, padX: Int, padY: Int,
         confidence: Float
     ): ByteArray {
-        // Step 1: produce a 160x160 mask in proto space (which lives in 640-space / 4)
-        val protoMask = FloatArray(MASK_PROTO_SIZE * MASK_PROTO_SIZE)
-        for (y in 0 until MASK_PROTO_SIZE) {
-            for (x in 0 until MASK_PROTO_SIZE) {
-                val v = protos[y][x]
+        val protoScale = MASK_PROTO_SIZE.toFloat() / INPUT_SIZE.toFloat()  // 0.25
+        val maxP = MASK_PROTO_SIZE - 1
+
+        // Expand sampling region beyond bbox to catch extremities (feet, hands)
+        // that the proto-mask covers but the bbox doesn't fully enclose.
+        val padW = (bbox.width() * BBOX_MASK_PAD).toInt()
+        val padH = (bbox.height() * BBOX_MASK_PAD).toInt()
+        val ix1 = (bbox.left.toInt() - padW).coerceAtLeast(0)
+        val iy1 = (bbox.top.toInt() - padH).coerceAtLeast(0)
+        val ix2 = (bbox.right.toInt() + padW).coerceAtMost(srcW - 1)
+        val iy2 = (bbox.bottom.toInt() + padH).coerceAtMost(srcH - 1)
+
+        val py1 = ((iy1 * scale + padY) * protoScale).toInt().coerceIn(0, maxP)
+        val py2 = ((iy2 * scale + padY) * protoScale).toInt().coerceIn(0, maxP)
+        val px1 = ((ix1 * scale + padX) * protoScale).toInt().coerceIn(0, maxP)
+        val px2 = ((ix2 * scale + padX) * protoScale).toInt().coerceIn(0, maxP)
+
+        val protoY1 = (py1 - 1).coerceAtLeast(0)
+        val protoY2 = (py2 + 1).coerceAtMost(maxP)
+        val protoX1 = (px1 - 1).coerceAtLeast(0)
+        val protoX2 = (px2 + 1).coerceAtMost(maxP)
+
+        // Sigmoid only within bbox region of proto space
+        val regionW = protoX2 - protoX1 + 1
+        val regionH = protoY2 - protoY1 + 1
+        val protoMask = FloatArray(regionH * regionW)
+        for (y in protoY1..protoY2) {
+            val v = protos[y]
+            val rowOff = (y - protoY1) * regionW
+            for (x in protoX1..protoX2) {
                 var sum = 0f
-                for (k in 0 until NUM_MASK_COEFFS) sum += v[k] * coeffs[k]
-                protoMask[y * MASK_PROTO_SIZE + x] = sigmoid(sum)
+                val proto = v[x]
+                for (k in 0 until NUM_MASK_COEFFS) sum += proto[k] * coeffs[k]
+                protoMask[rowOff + (x - protoX1)] = sigmoid(sum)
             }
         }
 
-        // Step 2: map source bbox → proto coordinates
-        // proto_x = (src_x * scale + padX) / 4
+        // Adaptive threshold: loose for low-conf, tight for high-conf
+        val maskThreshold = MASK_THRESH_MIN + (MASK_THRESH_MAX - MASK_THRESH_MIN) * confidence
+
+        // Bilinear upsample from proto mask into output within bbox
         val out = ByteArray(srcW * srcH)
-        val protoScale = MASK_PROTO_SIZE.toFloat() / INPUT_SIZE.toFloat()  // 0.25
-
-        val ix1 = bbox.left.toInt().coerceAtLeast(0)
-        val iy1 = bbox.top.toInt().coerceAtLeast(0)
-        val ix2 = bbox.right.toInt().coerceAtMost(srcW - 1)
-        val iy2 = bbox.bottom.toInt().coerceAtMost(srcH - 1)
-
         for (y in iy1..iy2) {
-            val py = ((y * scale + padY) * protoScale).toInt().coerceIn(0, MASK_PROTO_SIZE - 1)
-            val rowBase = py * MASK_PROTO_SIZE
+            val pfY = (y * scale + padY) * protoScale
             val outRow = y * srcW
             for (x in ix1..ix2) {
-                val px = ((x * scale + padX) * protoScale).toInt().coerceIn(0, MASK_PROTO_SIZE - 1)
-                val maskThreshold = MASK_THRESH_MIN
-                if (protoMask[rowBase + px] > maskThreshold) {
+                val pfX = (x * scale + padX) * protoScale
+
+                val x0 = pfX.toInt().coerceIn(protoX1, protoX2)
+                val y0 = pfY.toInt().coerceIn(protoY1, protoY2)
+                val x1 = (x0 + 1).coerceAtMost(protoX2)
+                val y1 = (y0 + 1).coerceAtMost(protoY2)
+
+                val fx = pfX - x0
+                val fy = pfY - y0
+
+                val rx0 = x0 - protoX1
+                val rx1 = x1 - protoX1
+                val ry0 = (y0 - protoY1) * regionW
+                val ry1 = (y1 - protoY1) * regionW
+
+                val v00 = protoMask[ry0 + rx0]
+                val v10 = protoMask[ry0 + rx1]
+                val v01 = protoMask[ry1 + rx0]
+                val v11 = protoMask[ry1 + rx1]
+
+                val value = v00 * (1 - fx) * (1 - fy) +
+                            v10 * fx * (1 - fy) +
+                            v01 * (1 - fx) * fy +
+                            v11 * fx * fy
+
+                if (value > maskThreshold) {
                     out[outRow + x] = 1
                 }
             }
