@@ -47,7 +47,13 @@ class MlRepository(private val appContext: Context) {
         if (lamaAttempted) return@withLock lamaInstance
         lamaAttempted = true
         try {
-            LamaInpainter(appContext).also { lamaInstance = it }
+            LamaInpainter(appContext).also {
+                lamaInstance = it
+                // Run a dummy inference so ORT JIT / delegate init happens
+                // off the user-visible capture path. Cheap (~few hundred ms
+                // at 64×64) and saves that latency on the first real capture.
+                it.warmUp()
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "LaMa init failed; capture pipeline will fall back to OpenCV Telea", t)
             null

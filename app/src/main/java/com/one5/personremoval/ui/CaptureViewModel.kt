@@ -21,7 +21,6 @@ import com.one5.personremoval.core.PersonState
 import com.one5.personremoval.core.Tracker
 import com.one5.personremoval.ml.YoloSegmenter
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,10 +41,6 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     val tracker = Tracker()
     val nativeSession = NativeSession(capacity = 45)
     private val mlRepository = (application as PersonRemovalApp).mlRepository
-    // Optional alpha-matting refiner. Loads modnet.tflite if present;
-    // gracefully no-ops if the asset is missing.
-    private val mattingRefiner: com.one5.personremoval.ml.MattingRefiner =
-        com.one5.personremoval.ml.MattingRefiner(application)
     // Gyroscope integrator: provides a per-frame device rotation matrix so
     // the native aligner can fall back to a gyro-derived homography when
     // ORB/AKAZE feature matching produces no inliers (texture-poor scenes:
@@ -54,32 +49,12 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         com.one5.personremoval.sensors.GyroIntegrator(application)
     private val captureUseCase = CaptureUseCase(nativeSession)
 
-    // Snapshot of the most recently pushed analyzer frame (RGBA layout, as
-    // delivered by CameraX). Used as the reference image for matting
-    // refinement at capture time. Updated by the analyzer coroutine, read
-    // by the capture coroutine — Volatile is sufficient because the writer
-    // is single-threaded and the reader tolerates one frame of staleness
-    // (the native ring buffer's reference is at most one frame ahead, well
-    // within matting's bbox-padding slack).
-    @Volatile private var latestRgba: ByteArray? = null
-    @Volatile private var latestRgbaW: Int = 0
-    @Volatile private var latestRgbaH: Int = 0
-
-    // Two-slot ping-pong for the analyzer RGBA buffer. The analyzer writes
-    // into one slot, publishes the reference via `latestRgba`, and toggles
-    // to the other slot for the next frame. Eliminates the per-frame
-    // ~8 MB allocation that dominated analyzer-thread GC pressure on
-    // low-end devices. Safe because the capture coroutine only reads
-    // `latestRgba` while `_isProcessing == true`, during which the
-    // analyzer bails at the top of `collectLatest` and does not write.
-    // After capture re-enables the analyzer the next write lands in the
-    // *other* slot (toggle persists across the capture), so the slot
-    // capture had been holding cannot be overwritten mid-read. Touched
-    // only by the analyzer coroutine, no synchronization needed.
-    private var frameSlotA: ByteArray? = null
-    private var frameSlotB: ByteArray? = null
+    // Reusable analyzer RGBA buffer. pushFrame copies into the native ring
+    // buffer synchronously, so a single slot is safe to overwrite next frame.
+    // Avoids the per-frame ~8 MB allocation that dominated analyzer-thread
+    // GC pressure on low-end devices.
+    private var frameSlot: ByteArray? = null
     private var frameSlotBytes: Int = 0
-    private var nextSlotIsB: Boolean = false
 
     // AE re-lock on large camera motion. When the user physically moves
     // (walks to different position), exposure/WB lock becomes stale. Track
@@ -121,7 +96,6 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             captureUseCase.lamaInpainter = mlRepository.lama()
         }
-        captureUseCase.mattingRefiner = mattingRefiner
         // Start gyro accumulation. The rotation matrix resets here so all
         // subsequent buffer frames are expressed in a common reference
         // frame (the moment the VM was constructed).
@@ -157,12 +131,10 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     // returns a different ImageAnalysis profile). Steady-state
                     // path hits neither branch.
                     if (frameSlotBytes != needed) {
-                        frameSlotA = ByteArray(needed)
-                        frameSlotB = ByteArray(needed)
+                        frameSlot = ByteArray(needed)
                         frameSlotBytes = needed
-                        nextSlotIsB = false
                     }
-                    val rgba = if (nextSlotIsB) frameSlotB!! else frameSlotA!!
+                    val rgba = frameSlot!!
                     if (rowStride == w * 4) {
                         buf.get(rgba)
                     } else {
@@ -190,20 +162,6 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     val trackIds = IntArray(tracked.size) { i -> tracked[i].trackId }
                     val rot = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
                     nativeSession.pushFrame(rgba, w, h, masks, nowMs, rot, trackIds)
-
-                    // Snapshot for matting refinement at capture time.
-                    // Publish the just-filled slot via the @Volatile
-                    // reference; the capture coroutine reads atomically.
-                    // Toggle AFTER publishing so the next frame writes
-                    // into the OTHER slot — the one capture cannot be
-                    // holding. Cancellation of this collectLatest block
-                    // (mid-detect / mid-pushFrame) leaves the toggle
-                    // untouched and reuses the same slot on retry, which
-                    // is safe because no consumer ever observed it.
-                    latestRgba = rgba
-                    latestRgbaW = w
-                    latestRgbaH = h
-                    nextSlotIsB = !nextSlotIsB
 
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
@@ -308,32 +266,21 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 // same opLock that pushFrame holds, so any in-flight push completes
                 // before stitching reads the buffer. No additional wait needed.
                 nativeSession.frozen = true
-                val hiResDeferred = async { cameraManager.captureHighRes() }
 
                 val d = _detection.value
                 val states = tracker.getStates()
                 val (result, status) = if (d != null) {
-                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight,
-                            referenceRgba = latestRgba)
+                    captureUseCase.execute(d.persons, states, d.sourceWidth, d.sourceHeight)
                 } else {
                     null to "no detection yet"
                 }
                 if (result == null) {
-                    hiResDeferred.cancel()
                     _toastEvents.tryEmit(ToastEvent(status))
                     _lastResultText.value = status
                     return@launch
                 }
 
-                val hiResBitmap = hiResDeferred.await()
-                if (hiResBitmap != null) {
-                    val stream = java.io.ByteArrayOutputStream()
-                    hiResBitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream)
-                    GallerySaver.save(getApplication(), stream.toByteArray())
-                    hiResBitmap.recycle()
-                }
                 val jpeg = nativeSession.encodeJpeg(result.rgb, result.width, result.height)
-
                 if (jpeg == null) {
                     _toastEvents.tryEmit(ToastEvent("JPEG encode failed"))
                     return@launch
@@ -377,7 +324,6 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         gyroIntegrator.stop()
         cameraManager.shutdown()
         segmenter.close()
-        mattingRefiner.close()
         nativeSession.close()
     }
 

@@ -55,6 +55,10 @@ class LamaInpainter(
         // Fraction of each tile that overlaps with its neighbor. The
         // overlap region carries the feather-blended seam.
         private const val TILE_OVERLAP_FRAC = 0.40f
+        // Feather radius (pixels) for the LaMa↔stitcher boundary blend.
+        // Wide enough to hide the seam, narrow enough to keep the LaMa
+        // patch sharp inside the mask.
+        private const val FEATHER_RADIUS = 3
     }
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
@@ -204,14 +208,46 @@ class LamaInpainter(
         val w = workingSize
         val h = workingSize
 
-        // 1. Resize image + mask to working size via Bitmap.scale (fastest available on Android).
-        val srcBmp = rgbBytesToBitmap(rgb, width, height)
+        // 1a. Letterbox crop to square so LaMa receives an aspect-preserved
+        // image. Stretching a tall/wide crop to 512×512 distorts texture
+        // statistics LaMa was trained on. Pad short axis with 128-grey,
+        // mask=0 in the pad region so LaMa never hallucinates outside the
+        // real crop.
+        val side = max(width, height)
+        val padX = (side - width) / 2
+        val padY = (side - height) / 2
+        val isSquare = side == width && side == height
+        val squareRgb: ByteArray
+        val squareMask: ByteArray
+        if (isSquare) {
+            squareRgb = rgb
+            squareMask = mask
+        } else {
+            squareRgb = ByteArray(side * side * 3)
+            java.util.Arrays.fill(squareRgb, 128.toByte())
+            squareMask = ByteArray(side * side)
+            for (yy in 0 until height) {
+                val srcRow = yy * width
+                val dstRow = (padY + yy) * side
+                for (xx in 0 until width) {
+                    val s = srcRow + xx
+                    val d = dstRow + (padX + xx)
+                    squareRgb[d * 3]     = rgb[s * 3]
+                    squareRgb[d * 3 + 1] = rgb[s * 3 + 1]
+                    squareRgb[d * 3 + 2] = rgb[s * 3 + 2]
+                    squareMask[d] = mask[s]
+                }
+            }
+        }
+
+        // 1b. Resize square image + mask to working size via Bitmap.scale.
+        val srcBmp = rgbBytesToBitmap(squareRgb, side, side)
         val scaledBmp = srcBmp.scale(w, h)
         srcBmp.recycle()
         val resizedRgb = bitmapToRgbBytes(scaledBmp)
         scaledBmp.recycle()
 
-        val resizedMask = nearestResizeMask(mask, width, height, w, h)
+        val resizedMask = nearestResizeMask(squareMask, side, side, w, h)
 
         // 2. Build input tensors. ONNX wants channel-first float32.
         //    IMPORTANT: zero out the masked pixels in the image before sending.
@@ -293,25 +329,38 @@ class LamaInpainter(
             outRgbWorking[i * 3 + 2] = floatPixelToByte(b)
         }
 
-        // 5. Resize back to source size.
+        // 5. Resize back to square side, then crop pad off to original (w,h).
         val outBmpWorking = rgbBytesToBitmap(outRgbWorking, w, h)
-        val outBmpFinal = outBmpWorking.scale(width, height)
+        val outBmpSquare = outBmpWorking.scale(side, side)
         outBmpWorking.recycle()
-        val outRgbFinal = bitmapToRgbBytes(outBmpFinal)
-        outBmpFinal.recycle()
+        val outSquareRgb = bitmapToRgbBytes(outBmpSquare)
+        outBmpSquare.recycle()
 
-        // 6. Composite: only replace mask pixels in the original. Keeps stitched
-        //    pixels pixel-perfect and only LaMa-inpaints the holes.
-        val composed = rgb.copyOf()
-        for (i in 0 until width * height) {
-            if (mask[i].toInt() != 0) {
-                composed[i * 3]     = outRgbFinal[i * 3]
-                composed[i * 3 + 1] = outRgbFinal[i * 3 + 1]
-                composed[i * 3 + 2] = outRgbFinal[i * 3 + 2]
+        val outRgbFinal: ByteArray = if (isSquare) {
+            outSquareRgb
+        } else {
+            val cropped = ByteArray(width * height * 3)
+            for (yy in 0 until height) {
+                val srcRow = (padY + yy) * side
+                val dstRow = yy * width
+                for (xx in 0 until width) {
+                    val s = srcRow + (padX + xx)
+                    val d = dstRow + xx
+                    cropped[d * 3]     = outSquareRgb[s * 3]
+                    cropped[d * 3 + 1] = outSquareRgb[s * 3 + 1]
+                    cropped[d * 3 + 2] = outSquareRgb[s * 3 + 2]
+                }
             }
+            cropped
         }
 
-        Log.i(TAG, "inpaint: src=${width}x${height} work=${w}x${h} infer=${ms}ms")
+        // 6. Composite with feathered alpha at the mask boundary so the
+        //    LaMa↔stitcher seam fades smoothly instead of showing a
+        //    single-pixel discontinuity.
+        val composed = rgb.copyOf()
+        featherCompositeInPlace(composed, outRgbFinal, mask, width, height, FEATHER_RADIUS)
+
+        Log.i(TAG, "inpaint: src=${width}x${height} pad=${side}x${side} work=${w}x${h} infer=${ms}ms")
         return composed
     }
 
@@ -353,18 +402,41 @@ class LamaInpainter(
             return rgb
         }
 
+        // Sort components by area descending so the biggest gaps (where
+        // LaMa quality matters most) get processed first within the
+        // maxLamaCalls budget. Without this the cap is in raster scan
+        // order — a small top-left gap can crowd out a huge center gap.
+        val sortedComponents = components.sortedByDescending {
+            (it.right - it.left).toLong() * (it.bottom - it.top)
+        }
+
         Log.i(TAG, "inpaintGaps: ${components.size} component(s) in ${width}x${height}")
         val result = rgb.copyOf()
         var lamaCalls = 0
 
-        for ((idx, comp) in components.withIndex()) {
+        for ((idx, comp) in sortedComponents.withIndex()) {
             val compW = comp.right - comp.left
             val compH = comp.bottom - comp.top
             val pad = maxOf(paddingPx, compW / 3, compH / 3)
-            val x0 = (comp.left - pad).coerceAtLeast(0)
-            val y0 = (comp.top - pad).coerceAtLeast(0)
-            val x1 = (comp.right + pad).coerceAtMost(width)
-            val y1 = (comp.bottom + pad).coerceAtMost(height)
+
+            // Symmetric padding: when one side is clipped against the
+            // image edge, redistribute the lost budget to the opposite
+            // side so LaMa always sees the same total context volume.
+            // Without this, a gap near the left edge gets 0px context
+            // left + full pad right — LaMa hallucinates against an
+            // unbalanced surround.
+            val leftWant = comp.left - pad
+            val rightWant = comp.right + pad
+            val topWant = comp.top - pad
+            val bottomWant = comp.bottom + pad
+            val leftClip = (-leftWant).coerceAtLeast(0)
+            val rightClip = (rightWant - width).coerceAtLeast(0)
+            val topClip = (-topWant).coerceAtLeast(0)
+            val bottomClip = (bottomWant - height).coerceAtLeast(0)
+            val x0 = (leftWant - rightClip).coerceAtLeast(0)
+            val y0 = (topWant - bottomClip).coerceAtLeast(0)
+            val x1 = (rightWant + leftClip).coerceAtMost(width)
+            val y1 = (bottomWant + topClip).coerceAtMost(height)
             val cw = x1 - x0
             val ch = y1 - y0
             if (cw <= 0 || ch <= 0) continue
@@ -393,22 +465,27 @@ class LamaInpainter(
                 break
             }
 
-            val inpainted = inpaint(cropRgb, cropMask, cw, ch) ?: continue
+            // Route huge crops through the 2×2 tile path so per-tile
+            // downscale ratio stays low. Single-pass `inpaint` would
+            // squash a 1000×1200 crop into 512×512, blurring detail
+            // LaMa generated at full resolution.
+            val inpainted: ByteArray =
+                if (cw > LARGE_CROP_THRESHOLD || ch > LARGE_CROP_THRESHOLD) {
+                    inpaintLargeCrop(cropRgb, cropMask, cw, ch)
+                } else {
+                    inpaint(cropRgb, cropMask, cw, ch) ?: continue
+                }
             lamaCalls++
 
-            for (y in 0 until ch) {
-                val srcRow = y * cw
-                val dstRow = (y0 + y) * width
-                for (x in 0 until cw) {
-                    val srcIdx = srcRow + x
-                    val dstIdx = dstRow + (x0 + x)
-                    if (mask[dstIdx].toInt() != 0) {
-                        result[dstIdx * 3]     = inpainted[srcIdx * 3]
-                        result[dstIdx * 3 + 1] = inpainted[srcIdx * 3 + 1]
-                        result[dstIdx * 3 + 2] = inpainted[srcIdx * 3 + 2]
-                    }
-                }
-            }
+            // Feathered paste back into running result. `inpainted` already
+            // matches `cropRgb` outside the mask (inner composite preserves
+            // those pixels), so the feather only affects the boundary band
+            // where mask transitions to non-mask.
+            featherPasteInto(
+                result, width, height,
+                inpainted, cw, ch,
+                cropMask, x0, y0, FEATHER_RADIUS
+            )
         }
         return result
     }
@@ -606,6 +683,164 @@ class LamaInpainter(
 
     private fun Bitmap.scale(w: Int, h: Int): Bitmap {
         return Bitmap.createScaledBitmap(this, w, h, /* filter = */ true)
+    }
+
+    /**
+     * Compute a feathered alpha map (0..255) from a binary mask. The result
+     * is 255 deep inside the mask, fades smoothly across a band of width
+     * ~2*radius centered on the mask boundary, and 0 outside that band.
+     *
+     * Built as: dilate(mask, radius) then box-blur with radius. Dilation
+     * keeps alpha=255 across the original mask interior; the blur shapes
+     * the falloff into the surrounding ring.
+     *
+     * O(N * (2r+1)) per pass, four passes total — for r=3 and a 1000×1000
+     * crop that's ~28 M ops, sub-50 ms on arm64.
+     */
+    private fun computeFeatherAlpha(mask: ByteArray, w: Int, h: Int, radius: Int): ByteArray {
+        val n = w * h
+        // Dilate horizontally then vertically (separable). Result is 1 inside
+        // the dilated set, 0 outside.
+        val dilH = ByteArray(n)
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                val xMin = (x - radius).coerceAtLeast(0)
+                val xMax = (x + radius).coerceAtMost(w - 1)
+                var any = false
+                for (xx in xMin..xMax) {
+                    if (mask[row + xx].toInt() != 0) { any = true; break }
+                }
+                if (any) dilH[row + x] = 1
+            }
+        }
+        val dilated = ByteArray(n)
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                val yMin = (y - radius).coerceAtLeast(0)
+                val yMax = (y + radius).coerceAtMost(h - 1)
+                var any = false
+                for (yy in yMin..yMax) {
+                    if (dilH[yy * w + x].toInt() != 0) { any = true; break }
+                }
+                if (any) dilated[y * w + x] = 1
+            }
+        }
+        // Box-blur the dilated 0/255 map (separable horiz + vert).
+        val blurH = IntArray(n)
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                val xMin = (x - radius).coerceAtLeast(0)
+                val xMax = (x + radius).coerceAtMost(w - 1)
+                var sum = 0
+                for (xx in xMin..xMax) sum += if (dilated[row + xx].toInt() != 0) 255 else 0
+                blurH[row + x] = sum / (xMax - xMin + 1)
+            }
+        }
+        val out = ByteArray(n)
+        for (x in 0 until w) {
+            for (y in 0 until h) {
+                val yMin = (y - radius).coerceAtLeast(0)
+                val yMax = (y + radius).coerceAtMost(h - 1)
+                var sum = 0
+                for (yy in yMin..yMax) sum += blurH[yy * w + x]
+                out[y * w + x] = (sum / (yMax - yMin + 1)).toByte()
+            }
+        }
+        return out
+    }
+
+    /**
+     * Composite [src] into [base] using a feathered alpha derived from
+     * [mask]. Pixels deep inside the mask are replaced fully, pixels at the
+     * boundary blend linearly, pixels outside the feather band stay
+     * untouched. Modifies [base] in place.
+     */
+    private fun featherCompositeInPlace(
+        base: ByteArray, src: ByteArray, mask: ByteArray,
+        w: Int, h: Int, radius: Int
+    ) {
+        val alpha = computeFeatherAlpha(mask, w, h, radius)
+        for (i in 0 until w * h) {
+            val a = alpha[i].toInt() and 0xFF
+            if (a == 0) continue
+            val pi = i * 3
+            if (a == 255) {
+                base[pi]     = src[pi]
+                base[pi + 1] = src[pi + 1]
+                base[pi + 2] = src[pi + 2]
+            } else {
+                val invA = 255 - a
+                val br = base[pi].toInt() and 0xFF
+                val bg = base[pi + 1].toInt() and 0xFF
+                val bb = base[pi + 2].toInt() and 0xFF
+                val sr = src[pi].toInt() and 0xFF
+                val sg = src[pi + 1].toInt() and 0xFF
+                val sb = src[pi + 2].toInt() and 0xFF
+                base[pi]     = ((sr * a + br * invA + 127) / 255).toByte()
+                base[pi + 1] = ((sg * a + bg * invA + 127) / 255).toByte()
+                base[pi + 2] = ((sb * a + bb * invA + 127) / 255).toByte()
+            }
+        }
+    }
+
+    /**
+     * Paste a same-size inpainted crop ([src], dims [srcW]×[srcH]) into a
+     * larger destination ([dst], dims [dstW]×[dstH]) at offset
+     * ([dstX0], [dstY0]) using a feathered alpha derived from [srcMask].
+     * Pixels outside the feather band stay untouched (preserving prior
+     * gap fills and stitcher output).
+     */
+    private fun featherPasteInto(
+        dst: ByteArray, dstW: Int, dstH: Int,
+        src: ByteArray, srcW: Int, srcH: Int,
+        srcMask: ByteArray, dstX0: Int, dstY0: Int, radius: Int
+    ) {
+        val alpha = computeFeatherAlpha(srcMask, srcW, srcH, radius)
+        for (y in 0 until srcH) {
+            val srcRow = y * srcW
+            val dstRow = (dstY0 + y) * dstW
+            for (x in 0 until srcW) {
+                val a = alpha[srcRow + x].toInt() and 0xFF
+                if (a == 0) continue
+                val sIdx = (srcRow + x) * 3
+                val dIdx = (dstRow + (dstX0 + x)) * 3
+                if (a == 255) {
+                    dst[dIdx]     = src[sIdx]
+                    dst[dIdx + 1] = src[sIdx + 1]
+                    dst[dIdx + 2] = src[sIdx + 2]
+                } else {
+                    val invA = 255 - a
+                    val dr = dst[dIdx].toInt() and 0xFF
+                    val dg = dst[dIdx + 1].toInt() and 0xFF
+                    val db = dst[dIdx + 2].toInt() and 0xFF
+                    val sr = src[sIdx].toInt() and 0xFF
+                    val sg = src[sIdx + 1].toInt() and 0xFF
+                    val sb = src[sIdx + 2].toInt() and 0xFF
+                    dst[dIdx]     = ((sr * a + dr * invA + 127) / 255).toByte()
+                    dst[dIdx + 1] = ((sg * a + dg * invA + 127) / 255).toByte()
+                    dst[dIdx + 2] = ((sb * a + db * invA + 127) / 255).toByte()
+                }
+            }
+        }
+    }
+
+    /**
+     * Run a dummy 64×64 inference once at construction so ORT's JIT/kernel
+     * compilation and any delegate (NNAPI/XNNPACK) initialization happens
+     * off the user-visible capture path. First real capture would otherwise
+     * be 300–800 ms slower than steady state.
+     */
+    fun warmUp() {
+        val side = 64
+        val rgb = ByteArray(side * side * 3) // black input is fine for warmup
+        val mask = ByteArray(side * side).apply { this[0] = 1 } // tiny non-empty mask
+        runCatching {
+            val t0 = System.currentTimeMillis()
+            inpaint(rgb, mask, side, side)
+            Log.i(TAG, "warmUp done in ${System.currentTimeMillis() - t0}ms")
+        }.onFailure { Log.w(TAG, "warmUp failed (non-fatal): ${it.message}") }
     }
 
     /**

@@ -62,15 +62,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     }
 
     /**
-     * Phase 7 verification: aligns every buffered frame (except the newest, used as reference)
-     * to the reference frame's viewpoint. Returns the number that aligned successfully.
-     * Result and timing are logged via LOG_TAG="PRNative".
-     */
-    fun testAlignment(): Int = opLock.withLock {
-        if (handle == 0L) -1 else nativeTestAlignment(handle)
-    }
-
-    /**
      * Phase 9 entry: runs stitching and returns everything the Kotlin side needs
      * to drive both the inpaint stage and the final seamless-clone blend.
      *  - `rgb`           : stitched RGB (reference with hole filled by real samples)
@@ -184,6 +175,21 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     ): Unit = nativeHarmonizeLamaRegion(rgb, mask, width, height)
 
     /**
+     * Pre-LaMa hole neutralization. Replaces every pixel in [rgb] where
+     * [mask] is non-zero with the mean RGB color of the 1-px ring just
+     * outside the hole. Used only when the stitch fill ratio is very low
+     * — the unfilled pixels otherwise still hold the reference frame's
+     * person-tinted colors, which LaMa would echo as a ghost in its
+     * output. Modifies [rgb] in place; no-op on too-sparse ring.
+     */
+    fun neutralizePreLama(
+        rgb: ByteArray,
+        mask: ByteArray,
+        width: Int,
+        height: Int
+    ): Unit = nativeNeutralizePreLama(rgb, mask, width, height)
+
+    /**
      * Composite the low-res stitched patch into a high-res camera capture.
      * The low-res patch is bicubic-upscaled to the bitmap's dimensions; the
      * low-res hole mask is bilinear-upscaled and re-thresholded; the two are
@@ -224,8 +230,7 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         /**
          * Pack an RGB byte array into an existing ARGB_8888 Bitmap (alpha
          * set to 0xFF). Returns true on success. Fast path replaces the
-         * Bitmap.setPixels(IntArray) per-pixel pack used by LamaInpainter
-         * and MattingRefiner.
+         * Bitmap.setPixels(IntArray) per-pixel pack used by LamaInpainter.
          */
         fun fillBitmapFromRgb(
             rgb: ByteArray, w: Int, h: Int, bmp: android.graphics.Bitmap
@@ -260,7 +265,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             rotation9: FloatArray?,
             trackIds: IntArray?
         )
-        @JvmStatic private external fun nativeTestAlignment(handle: Long): Int
         @JvmStatic private external fun nativeStitchForInpaint(
             handle: Long,
             removeMask: ByteArray, maskW: Int, maskH: Int,
@@ -285,6 +289,9 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             rgba: ByteArray, width: Int, height: Int
         ): ByteArray?
         @JvmStatic private external fun nativeHarmonizeLamaRegion(
+            rgb: ByteArray, mask: ByteArray, width: Int, height: Int
+        )
+        @JvmStatic private external fun nativeNeutralizePreLama(
             rgb: ByteArray, mask: ByteArray, width: Int, height: Int
         )
         @JvmStatic external fun nativeDilateMask(

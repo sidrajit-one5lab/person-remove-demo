@@ -52,17 +52,13 @@ class PersonRemovalApp : Application() {
     }
 
     /**
-     * Explicit startup audit of every ML asset bundled in the APK. Without this,
-     * a missing modnet.onnx silently disables matting refinement and the rest of
-     * the pipeline keeps working at lower quality with no obvious signal that
-     * something dropped out. Surfacing a yes/no per asset at app start makes
-     * dormancy visible in logcat.
+     * Explicit startup audit of every ML asset bundled in the APK. Surfacing
+     * a yes/no per asset at app start makes dormancy visible in logcat.
      */
     private fun logAssetAvailability() {
         val checks = listOf(
             "yolov8n-seg.tflite" to "YOLO segmenter",
-            "lama.onnx"          to "LaMa inpainter",
-            "modnet.onnx"        to "MODNet matting"
+            "lama.onnx"          to "LaMa inpainter"
         )
         for ((file, label) in checks) {
             val present = try { assets.openFd(file).use { true } } catch (_: Throwable) {

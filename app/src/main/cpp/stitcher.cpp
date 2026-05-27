@@ -58,7 +58,7 @@ StitchResult stitch(
     rsHi.reserve(numFrames);  gsHi.reserve(numFrames);  bsHi.reserve(numFrames);
 
     // Per-frame "is high quality" flag, computed once outside the per-pixel
-    // loop. Threshold 0.6 corresponds to ~0.67 px mean reprojection error;
+    // loop. Threshold 0.4 corresponds to ~1.0 px mean reprojection error;
     // matches the noise floor at the current detect scale.
     constexpr float kHiQualityCutoff = 0.4f;
     std::vector<uint8_t> isHiQuality(numFrames, 0);

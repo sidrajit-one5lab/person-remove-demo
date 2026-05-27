@@ -2,7 +2,6 @@ package com.one5.personremoval.core
 
 import android.util.Log
 import com.one5.personremoval.ml.LamaInpainter
-import com.one5.personremoval.ml.MattingRefiner
 
 data class PipelineResult(
     val rgb: ByteArray,
@@ -33,28 +32,13 @@ data class PipelineResult(
 class CaptureUseCase(
     private val nativeSession: NativeSession,
     @Volatile var lamaInpainter: LamaInpainter? = null,
-    @Volatile var mattingRefiner: MattingRefiner? = null
 ) {
 
-    /**
-     * Run the capture pipeline.
-     *
-     * @param referenceRgba  Optional RGBA snapshot of the latest analyzer
-     *                       frame. When provided alongside an available
-     *                       [mattingRefiner], MODNet refines the binary YOLO
-     *                       masks into sub-pixel alpha before building the
-     *                       REMOVE hole — much tighter boundaries (hair,
-     *                       jaw, fingertips) so the stitcher samples cleaner
-     *                       background. When omitted or the refiner is
-     *                       unavailable, falls back to the binary YOLO mask
-     *                       + bbox-floor approximation.
-     */
     fun execute(
         persons: List<Person>,
         states: Map<Int, PersonState>,
         sourceWidth: Int,
-        sourceHeight: Int,
-        referenceRgba: ByteArray? = null
+        sourceHeight: Int
     ): Pair<PipelineResult?, String> {
         val removePersons = persons.filter { (states[it.trackId] ?: PersonState.KEEP) == PersonState.REMOVE }
         if (removePersons.isEmpty()) {
@@ -64,17 +48,9 @@ class CaptureUseCase(
         val w = sourceWidth
         val h = sourceHeight
 
-        // Build REMOVE mask. Two paths:
-        //   1. MattingRefiner available + reference RGBA present → refine
-        //      each person's binary YOLO mask via MODNet. The refined alpha
-        //      is precise enough that the bbox-floor backup (which fills
-        //      the full bbox rect for large persons to compensate for YOLO
-        //      mask leak at hair/feet) is no longer needed.
-        //   2. Fallback path: binary YOLO mask OR'd across REMOVE persons,
-        //      plus bbox-floor for bbox area > 25% of frame.
-        // MODNet disabled — YOLO mask improvements (bilinear upsample,
-        // adaptive threshold, edge snap, bbox pad) provide sufficient
-        // mask quality. Saves ~900ms per capture.
+        // Binary YOLO mask OR'd across REMOVE persons, plus bbox-floor for
+        // large persons (>40% of frame) to compensate for YOLO mask leak at
+        // hair/feet boundaries.
         val removeMask = buildBinaryRemoveMaskWithBboxFloor(removePersons, w, h)
 
         val removeTrackIds = removePersons.map { it.trackId }.toIntArray()
@@ -103,20 +79,37 @@ class CaptureUseCase(
             filledRgb = cv ?: stitch.rgb
             inpaintMethod = if (cv == null) "none-failed" else "opencv-ns-fast"
         } else {
+            // Pre-fill hole with neutral ring-mean color when fill is so low
+            // that LaMa would otherwise see person-tinted stitcher output
+            // around the hole and bake a recognizable silhouette into its
+            // result. Producing a smooth color blob is psychologically much
+            // less distracting than a ghost. Clone stitch.rgb first because
+            // finalize() still needs the original reference for Poisson
+            // seamless cloning across the full stitched boundary.
+            val lamaInput: ByteArray = if (actualFill < NEUTRALIZE_FILL_THRESHOLD) {
+                val neutralized = stitch.rgb.copyOf()
+                nativeSession.neutralizePreLama(
+                    neutralized, stitch.unfilledMask, stitch.width, stitch.height
+                )
+                neutralized
+            } else {
+                stitch.rgb
+            }
             var ok: ByteArray? = null
-            var method = "opencv"
+            var method = if (lamaInput !== stitch.rgb) "lama+neutral" else "lama"
             lamaInpainter?.let { lama ->
                 try {
-                    ok = lama.inpaintGaps(stitch.rgb, stitch.unfilledMask,
+                    ok = lama.inpaintGaps(lamaInput, stitch.unfilledMask,
                                           stitch.width, stitch.height)
-                    method = "lama"
                 } catch (t: Throwable) {
                     Log.w(TAG, "LaMa inpaint threw, falling back", t)
+                    method = "opencv"
                 }
-            }
+            } ?: run { method = "opencv" }
             if (ok == null) {
                 ok = nativeSession.opencvInpaint(stitch.rgb, stitch.unfilledMask,
                                                  stitch.width, stitch.height)
+                method = "opencv"
             }
             filledRgb = ok ?: stitch.rgb
             inpaintMethod = if (ok == null) "none-failed" else method
@@ -168,23 +161,6 @@ class CaptureUseCase(
         ) to status
     }
 
-    private fun applyBboxFloor(mask: ByteArray, persons: List<Person>, w: Int, h: Int) {
-        val threshold = (w.toLong() * h * 0.40).toInt()
-        for (p in persons) {
-            val xMin = p.bBox.left.toInt().coerceAtLeast(0)
-            val yMin = p.bBox.top.toInt().coerceAtLeast(0)
-            val xMax = p.bBox.right.toInt().coerceAtMost(w - 1)
-            val yMax = p.bBox.bottom.toInt().coerceAtMost(h - 1)
-            val area = (xMax - xMin + 1) * (yMax - yMin + 1)
-            if (area > threshold) {
-                for (y in yMin..yMax) {
-                    val row = y * w
-                    for (x in xMin..xMax) mask[row + x] = 1
-                }
-            }
-        }
-    }
-
     private fun buildBinaryRemoveMaskWithBboxFloor(
         removePersons: List<Person>,
         w: Int,
@@ -216,20 +192,15 @@ class CaptureUseCase(
         return removeMask
     }
 
-    // Kotlin fallback for when nativeRgbaToRgb returns null (JNI byte-array
-    // pinning fails — practically only on OOM). Plain pixel reshape.
-    private fun rgbaToRgb(rgba: ByteArray, w: Int, h: Int): ByteArray {
-        val n = w * h
-        val rgb = ByteArray(n * 3)
-        for (i in 0 until n) {
-            rgb[i * 3]     = rgba[i * 4]
-            rgb[i * 3 + 1] = rgba[i * 4 + 1]
-            rgb[i * 3 + 2] = rgba[i * 4 + 2]
-        }
-        return rgb
-    }
-
     private companion object {
         const val TAG = "PRPipeline"
+        // Below this fill ratio, the unfilled hole is large enough that
+        // LaMa would otherwise produce a person-shaped ghost (the
+        // reference frame's still-visible subject tones leak into the
+        // model's input). Pre-fill the hole with a neutral ring-mean
+        // color first, so LaMa renders a smooth blob instead of a
+        // recognizable silhouette. 0.40 = roughly the point where the
+        // unfilled area exceeds typical LaMa "small gap" sweet spot.
+        const val NEUTRALIZE_FILL_THRESHOLD = 0.40f
     }
 }

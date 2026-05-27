@@ -1,5 +1,6 @@
 #include "aligner.h"
 
+#include <atomic>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
@@ -138,11 +139,14 @@ std::vector<AlignedFrame> alignToReference(
 
     const cv::Size refSize = reference.image.size();
 
-    // AKAZE is ~10× slower than ORB per frame. Cap AKAZE attempts to the
-    // newest 5 frames (most relevant for stitching). Older frames that
-    // fail ORB are simply skipped — the stitcher's dual-bucket quality
-    // weighting ensures enough good samples from the recent frames.
-    const size_t akazeStartIdx = frames.size() > 5 ? frames.size() - 5 : 0;
+    // AKAZE is ~10× slower than ORB per frame. Run it whenever ORB
+    // failed (need-based), regardless of frame age — the frames that
+    // benefit most are the texture-poor ones, not the most recent. To
+    // bound worst-case runtime, cap total AKAZE invocations per call
+    // with a shared atomic budget. Once exhausted, remaining ORB
+    // failures just skip (caught by the stitcher's quality weighting).
+    constexpr int kMaxAkazeCalls = 8;
+    std::atomic<int> akazeBudget{kMaxAkazeCalls};
 
     // -----------------------------------------------------------------
     // Two-phase alignment.
@@ -240,8 +244,10 @@ std::vector<AlignedFrame> alignToReference(
                     }
                 }
 
-                // Tier 2: AKAZE fallback (newest 5 frames only)
-                if (tier == 0 && !refDescAkaze.empty() && fi >= akazeStartIdx) {
+                // Tier 2: AKAZE fallback. Need-based: runs whenever ORB
+                // failed and the per-call AKAZE budget is not exhausted.
+                if (tier == 0 && !refDescAkaze.empty() &&
+                    akazeBudget.fetch_sub(1, std::memory_order_relaxed) > 0) {
                     cv::Mat grayAkaze;
                     cv::resize(gray, grayAkaze, akazeSize, 0, 0, cv::INTER_AREA);
                     cv::Mat candMaskAkaze;

@@ -269,47 +269,6 @@ Java_com_one5_personremoval_core_NativeSession_nativePushFrame(
     s->buffer->push(std::move(f));
 }
 
-/**
- * Phase 7 verification: snapshot the buffer, use the newest frame as the reference,
- * align every older frame to it, log how many succeeded and how long it took.
- * Returns the success count (or -1 on error).
- */
-JNIEXPORT jint JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeTestAlignment(
-        JNIEnv* /*env*/, jclass /*clazz*/, jlong handle) {
-
-    auto* s = asSession(handle);
-    if (!s) return -1;
-
-    auto snap = s->buffer->snapshot();
-    if (snap.size() < 2) {
-        LOGI("testAlignment: buffer has only %zu frames, need >= 2", snap.size());
-        return 0;
-    }
-
-    // Newest frame = reference; everything before it = candidates.
-    BufferedFrame reference = std::move(snap.back());
-    snap.pop_back();
-
-    LOGI("testAlignment: aligning %zu frames to reference %dx%d...",
-         snap.size(), reference.image.cols, reference.image.rows);
-
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-    auto aligned = alignToReference(reference, snap);
-    auto t1 = clk::now();
-
-    int ok = 0;
-    for (const auto& a : aligned) if (a.valid) ++ok;
-
-    auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    LOGI("testAlignment: aligned %d/%zu frames in %lld ms (%.1f ms/frame)",
-         ok, aligned.size(), (long long)totalMs,
-         aligned.empty() ? 0.0 : (double)totalMs / aligned.size());
-
-    return ok;
-}
-
 } // extern "C"
 
 // -------------------------------------------------------------------------- //
@@ -417,12 +376,16 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         cv::Mat kern = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(61, 61));
         cv::dilate(removeHole, dilatedHole, kern);
 
-        // Shadow expansion: extend downward only using a tall narrow kernel.
-        // Shadows fall below the person's feet; sideways expansion is unnecessary
-        // and would clip nearby KEEP persons.
-        cv::Mat shadowKern = cv::Mat::zeros(61, 3, CV_8UC1);
-        // Fill only the bottom half of the kernel → dilates downward
-        shadowKern(cv::Rect(0, 30, 3, 31)).setTo(255);
+        // Shadow expansion: extend downward using a kernel that's tall
+        // (reach below the feet) and roughly as wide as a foot's footprint
+        // (cover the cast shadow's actual width). The old 61×3 strip was
+        // effectively a centerline column — real shadows fall under the
+        // entire foot width, so most of the shadow leaked past the hole
+        // and reappeared as ghosting in the stitched result.
+        cv::Mat shadowKern = cv::Mat::zeros(61, 31, CV_8UC1);
+        // Fill only the bottom half of the kernel → dilates downward only.
+        // Width stays full (31 px) so the dilation covers the foot footprint.
+        shadowKern(cv::Rect(0, 30, 31, 31)).setTo(255);
         cv::dilate(dilatedHole, dilatedHole, shadowKern);
     }
 
@@ -1156,12 +1119,87 @@ Java_com_one5_personremoval_core_NativeSession_nativeHarmonizeLamaRegion(
 }
 
 /**
+ * Pre-LaMa hole neutralization. When the temporal stitch fills very little
+ * of the hole (actualFill is low because the subject stayed still), the
+ * unfilled pixels in [rgb] still hold the reference frame's person-tinted
+ * colors. Feeding that to LaMa as the "image" channel gives the model a
+ * person-shaped color hint surrounding the hole — its output then retains
+ * that silhouette as a soft tonal variation, which the user perceives as
+ * a ghost.
+ *
+ * This fn replaces every hole pixel with the mean color of the 1-px ring
+ * just outside the hole boundary. After this, LaMa sees a uniform-color
+ * hole with a sharp edge and clean surrounding context, and produces a
+ * smooth color blob — psychologically much less distracting than a
+ * recognizable shape, even if the patch still looks artificial.
+ *
+ * Modifies [rgb] in place. No-op when the ring is too sparse to compute
+ * a stable mean.
+ */
+JNIEXPORT void JNICALL
+Java_com_one5_personremoval_core_NativeSession_nativeNeutralizePreLama(
+        JNIEnv* env, jclass /*clazz*/,
+        jbyteArray rgb, jbyteArray mask, jint w, jint h) {
+    if (w <= 0 || h <= 0) return;
+    const size_t rgbLen  = static_cast<size_t>(w) * h * 3;
+    const size_t maskLen = static_cast<size_t>(w) * h;
+    if (env->GetArrayLength(rgb)  < (jsize)rgbLen)  return;
+    if (env->GetArrayLength(mask) < (jsize)maskLen) return;
+
+    jbyte* rgbPtr  = env->GetByteArrayElements(rgb, nullptr);
+    jbyte* maskPtr = env->GetByteArrayElements(mask, nullptr);
+    if (!rgbPtr || !maskPtr) {
+        if (rgbPtr)  env->ReleaseByteArrayElements(rgb, rgbPtr, JNI_ABORT);
+        if (maskPtr) env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
+        return;
+    }
+
+    // Wrap byte arrays as cv::Mats without copying. rgbMat is the writable
+    // canvas; maskMat is read-only.
+    cv::Mat rgbMat(h, w, CV_8UC3, rgbPtr);
+    cv::Mat maskMat(h, w, CV_8UC1, maskPtr);
+
+    // Threshold input mask to a clean 0/255 binary so the bitwise NOT below
+    // produces 0/255 (not 0xFE/0xFF), which would silently break the AND.
+    cv::Mat maskBin;
+    cv::threshold(maskMat, maskBin, 0, 255, cv::THRESH_BINARY);
+
+    // Ring = dilate(mask, 5px) AND NOT mask — the band of real pixels
+    // immediately outside the hole. 5 px is wide enough to average out
+    // texture noise and narrow enough to sample colors actually adjacent
+    // to the hole boundary (not distant scene content).
+    cv::Mat dilated;
+    cv::Mat kern = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(11, 11));
+    cv::dilate(maskBin, dilated, kern);
+    cv::Mat ring;
+    cv::bitwise_and(dilated, ~maskBin, ring);
+
+    const int ringCount = cv::countNonZero(ring);
+    if (ringCount < 200) {
+        env->ReleaseByteArrayElements(rgb,  rgbPtr,  JNI_ABORT);
+        env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
+        LOGI("neutralizePreLama: ring too sparse (%d px), skipping", ringCount);
+        return;
+    }
+
+    const cv::Scalar meanColor = cv::mean(rgbMat, ring);
+
+    // Paint every hole pixel with the ring's mean color.
+    rgbMat.setTo(meanColor, maskBin);
+
+    LOGI("neutralizePreLama: ring=%d mean=(%.0f,%.0f,%.0f)",
+         ringCount, meanColor[0], meanColor[1], meanColor[2]);
+
+    env->ReleaseByteArrayElements(rgb,  rgbPtr,  0);  // commit rgb writes
+    env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
+}
+
+/**
  * Fill an existing ARGB_8888 bitmap from a packed RGB byte array. Bitmap
  * dimensions must match (w, h). Alpha is set to 0xFF for every pixel.
  * Uses AndroidBitmap_lockPixels + cv::cvtColor (SIMD on arm64). Replaces
- * the Kotlin Bitmap.setPixels(IntArray) path in LamaInpainter and
- * MattingRefiner that allocated an IntArray + per-pixel pack on every
- * inpaint invocation.
+ * the Kotlin Bitmap.setPixels(IntArray) path in LamaInpainter that
+ * allocated an IntArray + per-pixel pack on every inpaint invocation.
  */
 JNIEXPORT jboolean JNICALL
 Java_com_one5_personremoval_core_NativeSession_nativeFillBitmapFromRgb(
