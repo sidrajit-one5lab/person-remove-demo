@@ -90,24 +90,8 @@ class CaptureUseCase(
         val actualFill = 1f - actualUnfilled.toFloat() / holePx
 
         val classicalThreshold = 0.85f
-        val lamaBailThreshold = 0.70f
         val needsInpaint = actualUnfilled > 0
-        val useLama = actualFill in lamaBailThreshold..< classicalThreshold
-
-        // Early bail: if less than 50% filled, LaMa will hallucinate on a
-        // massive hole — skip AI inpaint entirely, return the stitch as-is
-        // with a retry hint. Better than waiting 60s for bad output.
-        if (actualFill < lamaBailThreshold) {
-            val totalMs = System.currentTimeMillis() - t0
-            Log.w(TAG, "pipeline bail: fill=%.2f < %.2f, skipping inpaint (${totalMs}ms)"
-                .format(actualFill, lamaBailThreshold))
-            return PipelineResult(
-                rgb = stitch.rgb,
-                width = stitch.width,
-                height = stitch.height,
-                holeMask = stitch.fullHoleMask
-            ) to "not enough background — move camera around the subject before capturing"
-        }
+        val useLama = actualFill < classicalThreshold
 
         val filledRgb: ByteArray
         val inpaintMethod: String
