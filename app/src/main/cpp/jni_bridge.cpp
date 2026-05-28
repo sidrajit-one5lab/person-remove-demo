@@ -731,196 +731,6 @@ Java_com_one5_personremoval_core_NativeSession_nativeEncodeJpeg(
 }
 
 /**
- * Phase 11 / Level 2 — high-resolution output.
- *
- * Composites the low-resolution stitched patch into a full-sensor high-res
- * Bitmap captured by CameraX ImageCapture. The bulk of the output is the
- * sharp high-res sensor pixels; only the patched region is the upscaled
- * low-res stitched content, blended at the dilated-hole boundary with a
- * gaussian feather.
- *
- *   highResBitmap : Android Bitmap (ARGB_8888 expected) from ImageCapture →
- *                   captureHighRes(), already rotated upright.
- *   lowResStitched: w*h*3 RGB bytes — the stitcher's output (post matchTint /
- *                   unsharp / noise / feather).
- *   lowResMask    : w*h bytes — the dilated REMOVE hole used by the stitcher
- *                   (stitch.fullHoleMask in Kotlin).
- *   lowW, lowH    : low-res dimensions.
- *
- * Returns a JPEG-encoded ByteArray ready for GallerySaver, or null on any
- * failure (bitmap lock, decode, encode). All cv::Mats are stack-scoped via
- * RAII — no leaks if any intermediate step fails.
- */
-JNIEXPORT jbyteArray JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeCompositeHighRes(
-        JNIEnv* env, jclass /*clazz*/,
-        jobject highResBitmap,
-        jbyteArray lowResStitched, jbyteArray lowResMask,
-        jint lowW, jint lowH) {
-
-    if (lowW <= 0 || lowH <= 0) {
-        LOGW("compositeHighRes: invalid low-res dims %dx%d", lowW, lowH);
-        return nullptr;
-    }
-    const size_t lowRgbLen = static_cast<size_t>(lowW) * lowH * 3;
-    const size_t lowMaskLen = static_cast<size_t>(lowW) * lowH;
-    if (env->GetArrayLength(lowResStitched) < (jsize)lowRgbLen ||
-        env->GetArrayLength(lowResMask) < (jsize)lowMaskLen) {
-        LOGW("compositeHighRes: low-res input size mismatch");
-        return nullptr;
-    }
-
-    // ---- 1. Lock the Android Bitmap and wrap its pixels as a cv::Mat. -----
-    AndroidBitmapInfo info;
-    if (AndroidBitmap_getInfo(env, highResBitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
-        LOGW("compositeHighRes: AndroidBitmap_getInfo failed");
-        return nullptr;
-    }
-    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        LOGW("compositeHighRes: bitmap not RGBA_8888 (got %d)", (int)info.format);
-        return nullptr;
-    }
-    void* pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, highResBitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS ||
-        !pixels) {
-        LOGW("compositeHighRes: lockPixels failed");
-        return nullptr;
-    }
-
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-
-    // Bitmap storage is row-major RGBA. Wrap directly — no copy.
-    cv::Mat highResRgba((int)info.height, (int)info.width, CV_8UC4, pixels,
-                        (size_t)info.stride);
-    cv::Mat highRes;  // BGR for OpenCV downstream + JPEG encode
-    cv::cvtColor(highResRgba, highRes, cv::COLOR_RGBA2BGR);
-
-    // We can unlock as soon as we've copied OUT of the Bitmap's memory.
-    AndroidBitmap_unlockPixels(env, highResBitmap);
-
-    // ---- 2. Wrap the low-res inputs. --------------------------------------
-    jbyte* lowStPtr = env->GetByteArrayElements(lowResStitched, nullptr);
-    jbyte* lowMaskPtr = env->GetByteArrayElements(lowResMask, nullptr);
-    if (!lowStPtr || !lowMaskPtr) {
-        if (lowStPtr)   env->ReleaseByteArrayElements(lowResStitched, lowStPtr, JNI_ABORT);
-        if (lowMaskPtr) env->ReleaseByteArrayElements(lowResMask, lowMaskPtr, JNI_ABORT);
-        return nullptr;
-    }
-    cv::Mat lowRgb(lowH, lowW, CV_8UC3, lowStPtr);
-    cv::Mat lowMask(lowH, lowW, CV_8UC1, lowMaskPtr);
-
-    // Convert low-res to BGR to match high-res's color order.
-    cv::Mat lowBgr;
-    cv::cvtColor(lowRgb, lowBgr, cv::COLOR_RGB2BGR);
-
-    // ---- 3. Upscale low-res stitched + mask to high-res dimensions. -------
-    cv::Mat upStitched, upMask;
-    cv::resize(lowBgr,  upStitched, highRes.size(), 0, 0, cv::INTER_CUBIC);
-    cv::resize(lowMask, upMask,     highRes.size(), 0, 0, cv::INTER_NEAREST);
-    cv::threshold(upMask, upMask, 127, 255, cv::THRESH_BINARY);
-
-    env->ReleaseByteArrayElements(lowResStitched, lowStPtr, JNI_ABORT);
-    env->ReleaseByteArrayElements(lowResMask, lowMaskPtr, JNI_ABORT);
-
-    // ---- 4. Composite via Poisson seamless clone at hi-res. ---------------
-    // cv::seamlessClone solves the Poisson equation to insert the upscaled
-    // patch with the surrounding hi-res sensor pixels providing the
-    // gradient-domain boundary condition. Result: smooth tone/color/lighting
-    // match at the patch boundary even if the analyzer-tier upStitched
-    // disagrees with the ISP-processed highRes JPEG (different tone curve,
-    // sharpening, NR). Replaces the bicubic + Gaussian-alpha blend that
-    // produced a visible "haze ring" at the patch boundary.
-    //
-    // Constraints (handled below):
-    //   - Mask must not touch the image border. Pad mask interior by 2px.
-    //   - Mask must be CV_8UC1 binary {0, 255} (we already threshold above).
-    //   - Mask must have non-trivial area (>200 px) and sane bounding rect.
-    //   - seamlessClone occasionally throws on degenerate mask topology.
-    //     Fall back to the old alpha blend on any exception.
-    cv::Mat result;
-    bool poissonOk = false;
-    {
-        // Build a safe mask copy: clear a 2-px ring at the image border so
-        // seamlessClone's internal Laplacian solve doesn't hit the edge.
-        cv::Mat safeMask = upMask.clone();
-        safeMask.row(0).setTo(0);
-        safeMask.row(safeMask.rows - 1).setTo(0);
-        safeMask.col(0).setTo(0);
-        safeMask.col(safeMask.cols - 1).setTo(0);
-        if (safeMask.rows > 2 && safeMask.cols > 2) {
-            safeMask.row(1).setTo(0);
-            safeMask.row(safeMask.rows - 2).setTo(0);
-            safeMask.col(1).setTo(0);
-            safeMask.col(safeMask.cols - 2).setTo(0);
-        }
-
-        const int maskPx = cv::countNonZero(safeMask);
-        if (maskPx > 200) {
-            const cv::Rect bbox = cv::boundingRect(safeMask);
-            const cv::Point center(bbox.x + bbox.width / 2,
-                                   bbox.y + bbox.height / 2);
-            try {
-                cv::seamlessClone(upStitched, highRes, safeMask, center,
-                                  result, cv::NORMAL_CLONE);
-                poissonOk = !result.empty();
-            } catch (const cv::Exception& e) {
-                LOGW("compositeHighRes: seamlessClone (cv) threw: %s", e.what());
-            } catch (const std::exception& e) {
-                LOGW("compositeHighRes: seamlessClone (std) threw: %s", e.what());
-            }
-        } else {
-            LOGW("compositeHighRes: hi-res mask too sparse (%d px) for seamlessClone",
-                 maskPx);
-        }
-    }
-
-    if (!poissonOk) {
-        // Fallback: original Gaussian-feathered alpha blend. Maintains the
-        // pre-Poisson behavior for any edge case (mask touches border on
-        // both axes, degenerate topology, seamlessClone implementation bug).
-        const int featherRadius = std::max(15, std::min(highRes.cols, highRes.rows) / 64);
-        const int featherKsz = 2 * featherRadius + 1;
-        cv::Mat alpha8;
-        cv::GaussianBlur(upMask, alpha8, cv::Size(featherKsz, featherKsz), 0);
-        cv::Mat alphaF;
-        alpha8.convertTo(alphaF, CV_32F, 1.0 / 255.0);
-
-        cv::Mat highRes32, up32;
-        highRes.convertTo(highRes32, CV_32FC3);
-        upStitched.convertTo(up32, CV_32FC3);
-        std::vector<cv::Mat> ach{alphaF, alphaF, alphaF};
-        cv::Mat alpha3;
-        cv::merge(ach, alpha3);
-        cv::Mat blended32 = up32.mul(alpha3) +
-                            highRes32.mul(cv::Scalar::all(1) - alpha3);
-        blended32.convertTo(result, CV_8UC3);
-        LOGI("compositeHighRes: fell back to feather blend (radius=%d)", featherRadius);
-    }
-
-    // ---- 5. JPEG-encode. --------------------------------------------------
-    std::vector<uchar> jpegOut;
-    std::vector<int> jpegParams{cv::IMWRITE_JPEG_QUALITY, 95};
-    if (!cv::imencode(".jpg", result, jpegOut, jpegParams)) {
-        LOGW("compositeHighRes: imencode failed");
-        return nullptr;
-    }
-
-    auto t1 = clk::now();
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-    LOGI("compositeHighRes: high=%dx%d low=%dx%d method=%s %lldms jpegBytes=%zu",
-         highRes.cols, highRes.rows, lowW, lowH,
-         poissonOk ? "poisson" : "feather",
-         (long long)ms, jpegOut.size());
-
-    jbyteArray result_out = env->NewByteArray(static_cast<jsize>(jpegOut.size()));
-    if (!result_out) return nullptr;
-    env->SetByteArrayRegion(result_out, 0, static_cast<jsize>(jpegOut.size()),
-                            reinterpret_cast<const jbyte*>(jpegOut.data()));
-    return result_out;
-}
-
-/**
  * YOLO input preprocessing: letterbox resize + RGBA→RGB + optional float32
  * normalization, using OpenCV's SIMD-optimized kernels instead of Kotlin
  * per-pixel loops.
@@ -974,34 +784,6 @@ Java_com_one5_personremoval_ml_YoloSegmenter_nativeFillInputBuffer(
         resized.copyTo(padded(cv::Rect(padX, padY, dstW, dstH)));
         memcpy(bufPtr, padded.data, INPUT_SIZE * INPUT_SIZE * 3);
     }
-}
-
-/**
- * RGBA → RGB byte conversion. OpenCV cv::cvtColor uses SIMD on arm64.
- * Replaces the Kotlin per-pixel loop in CaptureUseCase.rgbaToRgb that
- * cost ~30-60 ms per capture at analyzer resolution.
- */
-JNIEXPORT jbyteArray JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeRgbaToRgb(
-        JNIEnv* env, jclass /*clazz*/,
-        jbyteArray rgba, jint w, jint h) {
-    if (w <= 0 || h <= 0) return nullptr;
-    const size_t rgbaLen = static_cast<size_t>(w) * h * 4;
-    const size_t rgbLen  = static_cast<size_t>(w) * h * 3;
-    if (env->GetArrayLength(rgba) < (jsize)rgbaLen) return nullptr;
-
-    jbyte* rgbaPtr = env->GetByteArrayElements(rgba, nullptr);
-    if (!rgbaPtr) return nullptr;
-    cv::Mat rgbaMat(h, w, CV_8UC4, rgbaPtr);
-    cv::Mat rgbMat;
-    cv::cvtColor(rgbaMat, rgbMat, cv::COLOR_RGBA2RGB);
-    env->ReleaseByteArrayElements(rgba, rgbaPtr, JNI_ABORT);
-
-    jbyteArray out = env->NewByteArray(static_cast<jsize>(rgbLen));
-    if (!out) return nullptr;
-    env->SetByteArrayRegion(out, 0, static_cast<jsize>(rgbLen),
-                            reinterpret_cast<const jbyte*>(rgbMat.data));
-    return out;
 }
 
 /**
@@ -1085,16 +867,22 @@ Java_com_one5_personremoval_core_NativeSession_nativeHarmonizeLamaRegion(
 
     if (outerN < 500 || innerN < 200) { release(); return; }
 
-    const auto clamp15 = [](int v) {
-        return v < -15 ? -15 : (v > 15 ? 15 : v);
+    // Tone clamp widened 15 → 25: the fill on a low-fill hole is a flat blob
+    // whose mean can sit further off the surround than ±15. A wider cap lets
+    // the shift actually reach the surrounding tone (killing the visible
+    // silhouette) while still bounding a runaway correction from a bad ring
+    // measurement. Only captures whose mismatch exceeds 15 change at all;
+    // well-matched fills (diff < 15) are unaffected.
+    const auto clampTone = [](int v) {
+        return v < -25 ? -25 : (v > 25 ? 25 : v);
     };
-    const int dr = clamp15(static_cast<int>(
+    const int dr = clampTone(static_cast<int>(
             static_cast<float>(outerR) / outerN -
             static_cast<float>(innerR) / innerN));
-    const int dg = clamp15(static_cast<int>(
+    const int dg = clampTone(static_cast<int>(
             static_cast<float>(outerG) / outerN -
             static_cast<float>(innerG) / innerN));
-    const int db = clamp15(static_cast<int>(
+    const int db = clampTone(static_cast<int>(
             static_cast<float>(outerB) / outerN -
             static_cast<float>(innerB) / innerN));
 
@@ -1119,25 +907,24 @@ Java_com_one5_personremoval_core_NativeSession_nativeHarmonizeLamaRegion(
 }
 
 /**
- * Pre-LaMa hole neutralization. When the temporal stitch fills very little
- * of the hole (actualFill is low because the subject stayed still), the
- * unfilled pixels in [rgb] still hold the reference frame's person-tinted
- * colors. Feeding that to LaMa as the "image" channel gives the model a
- * person-shaped color hint surrounding the hole — its output then retains
- * that silhouette as a soft tonal variation, which the user perceives as
- * a ghost.
+ * Post-fill grain match for the inpainted region. LaMa (and Telea) produce a
+ * smooth, low-frequency fill; against the grainy real surround that reads as
+ * an unnaturally clean patch the eye locks onto. This injects sensor noise
+ * matching the band just OUTSIDE the hole into the filled pixels so the patch
+ * sits in the same grain.
  *
- * This fn replaces every hole pixel with the mean color of the 1-px ring
- * just outside the hole boundary. After this, LaMa sees a uniform-color
- * hole with a sharp edge and clean surrounding context, and produces a
- * smooth color blob — psychologically much less distracting than a
- * recognizable shape, even if the patch still looks artificial.
+ * Reuses matchNoiseToReferenceSurround with the image as its own reference —
+ * it reads the outside-hole band for noise stats and writes only inside the
+ * hole, so the single-buffer aliasing is safe. The helper self-skips when the
+ * surround is too thin (<500 px) or too clean (noise floor < 0.5) to measure,
+ * so this is a no-op on synthetic / already-clean captures and can never
+ * degrade a good result. Modifies [rgb] in place.
  *
- * Modifies [rgb] in place. No-op when the ring is too sparse to compute
- * a stable mean.
+ * Call AFTER finalize(): the Poisson clone there would otherwise smooth the
+ * injected noise back out.
  */
 JNIEXPORT void JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeNeutralizePreLama(
+Java_com_one5_personremoval_core_NativeSession_nativeTextureLamaRegion(
         JNIEnv* env, jclass /*clazz*/,
         jbyteArray rgb, jbyteArray mask, jint w, jint h) {
     if (w <= 0 || h <= 0) return;
@@ -1154,43 +941,14 @@ Java_com_one5_personremoval_core_NativeSession_nativeNeutralizePreLama(
         return;
     }
 
-    // Wrap byte arrays as cv::Mats without copying. rgbMat is the writable
-    // canvas; maskMat is read-only.
     cv::Mat rgbMat(h, w, CV_8UC3, rgbPtr);
     cv::Mat maskMat(h, w, CV_8UC1, maskPtr);
-
-    // Threshold input mask to a clean 0/255 binary so the bitwise NOT below
-    // produces 0/255 (not 0xFE/0xFF), which would silently break the AND.
     cv::Mat maskBin;
     cv::threshold(maskMat, maskBin, 0, 255, cv::THRESH_BINARY);
 
-    // Ring = dilate(mask, 5px) AND NOT mask — the band of real pixels
-    // immediately outside the hole. 5 px is wide enough to average out
-    // texture noise and narrow enough to sample colors actually adjacent
-    // to the hole boundary (not distant scene content).
-    cv::Mat dilated;
-    cv::Mat kern = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(11, 11));
-    cv::dilate(maskBin, dilated, kern);
-    cv::Mat ring;
-    cv::bitwise_and(dilated, ~maskBin, ring);
+    matchNoiseToReferenceSurround(rgbMat, rgbMat, maskBin);
 
-    const int ringCount = cv::countNonZero(ring);
-    if (ringCount < 200) {
-        env->ReleaseByteArrayElements(rgb,  rgbPtr,  JNI_ABORT);
-        env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
-        LOGI("neutralizePreLama: ring too sparse (%d px), skipping", ringCount);
-        return;
-    }
-
-    const cv::Scalar meanColor = cv::mean(rgbMat, ring);
-
-    // Paint every hole pixel with the ring's mean color.
-    rgbMat.setTo(meanColor, maskBin);
-
-    LOGI("neutralizePreLama: ring=%d mean=(%.0f,%.0f,%.0f)",
-         ringCount, meanColor[0], meanColor[1], meanColor[2]);
-
-    env->ReleaseByteArrayElements(rgb,  rgbPtr,  0);  // commit rgb writes
+    env->ReleaseByteArrayElements(rgb,  rgbPtr,  0);          // commit rgb writes
     env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
 }
 

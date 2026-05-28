@@ -156,16 +156,9 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         nativeEncodeJpeg(rgb, width, height, quality)
 
     /**
-     * Drop the alpha channel from a CameraX RGBA_8888 byte array. Pure
-     * pixel reshape; uses OpenCV cv::cvtColor (SIMD on arm64).
-     */
-    fun rgbaToRgb(rgba: ByteArray, width: Int, height: Int): ByteArray? =
-        nativeRgbaToRgb(rgba, width, height)
-
-    /**
      * In-place tint harmonization for the LaMa-filled region. Shifts the
      * mean RGB of the masked pixels toward the 1-px ring of real pixels
-     * just outside, clamped to ±15 per channel. Modifies [rgb] in place.
+     * just outside, clamped to ±25 per channel. Modifies [rgb] in place.
      */
     fun harmonizeLamaRegion(
         rgb: ByteArray,
@@ -175,43 +168,19 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     ): Unit = nativeHarmonizeLamaRegion(rgb, mask, width, height)
 
     /**
-     * Pre-LaMa hole neutralization. Replaces every pixel in [rgb] where
-     * [mask] is non-zero with the mean RGB color of the 1-px ring just
-     * outside the hole. Used only when the stitch fill ratio is very low
-     * — the unfilled pixels otherwise still hold the reference frame's
-     * person-tinted colors, which LaMa would echo as a ghost in its
-     * output. Modifies [rgb] in place; no-op on too-sparse ring.
+     * In-place grain match for the inpainted region. Injects sensor noise
+     * matching the band just outside the hole into the filled pixels so the
+     * smooth LaMa/Telea patch sits in the same grain as the surround.
+     * Self-skips when the surround is too thin/clean to measure (no-op on
+     * synthetic inputs). Call AFTER [finalize] so the Poisson clone doesn't
+     * smooth the injected noise out. Modifies [rgb] in place.
      */
-    fun neutralizePreLama(
+    fun textureLamaRegion(
         rgb: ByteArray,
         mask: ByteArray,
         width: Int,
         height: Int
-    ): Unit = nativeNeutralizePreLama(rgb, mask, width, height)
-
-    /**
-     * Composite the low-res stitched patch into a high-res camera capture.
-     * The low-res patch is bicubic-upscaled to the bitmap's dimensions; the
-     * low-res hole mask is bilinear-upscaled and re-thresholded; the two are
-     * alpha-blended with a gaussian-feathered boundary so the patch sharpness
-     * discontinuity isn't a hard edge.
-     *
-     * Pixels outside the upscaled hole come straight from [hiResBitmap]
-     * (full sensor quality). Pixels inside come from [stitchedLoRgb]
-     * upscaled (the patched region — softer than the rest, but plausible).
-     *
-     * The bitmap must be in [Bitmap.Config.ARGB_8888] format (what CameraX
-     * ImageCapture decodes to). Native code locks the bitmap pixels directly
-     * (via android/bitmap.h jnigraphics) — no Kotlin-side pixel copy.
-     *
-     * Returns the JPEG-encoded composited result, or null on size mismatch /
-     * locking failure / OpenCV failure.
-     */
-    fun compositeHighRes(
-        hiResBitmap: android.graphics.Bitmap,
-        stitchedLoRgb: ByteArray, holeLo: ByteArray, loW: Int, loH: Int
-    ): ByteArray? =
-        nativeCompositeHighRes(hiResBitmap, stitchedLoRgb, holeLo, loW, loH)
+    ): Unit = nativeTextureLamaRegion(rgb, mask, width, height)
 
     override fun close() = opLock.withLock {
         if (handle != 0L) {
@@ -281,17 +250,10 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         @JvmStatic private external fun nativeEncodeJpeg(
             rgb: ByteArray, width: Int, height: Int, quality: Int
         ): ByteArray?
-        @JvmStatic private external fun nativeCompositeHighRes(
-            hiResBitmap: android.graphics.Bitmap,
-            stitchedLoRgb: ByteArray, holeLo: ByteArray, loW: Int, loH: Int
-        ): ByteArray?
-        @JvmStatic private external fun nativeRgbaToRgb(
-            rgba: ByteArray, width: Int, height: Int
-        ): ByteArray?
         @JvmStatic private external fun nativeHarmonizeLamaRegion(
             rgb: ByteArray, mask: ByteArray, width: Int, height: Int
         )
-        @JvmStatic private external fun nativeNeutralizePreLama(
+        @JvmStatic private external fun nativeTextureLamaRegion(
             rgb: ByteArray, mask: ByteArray, width: Int, height: Int
         )
         @JvmStatic external fun nativeDilateMask(

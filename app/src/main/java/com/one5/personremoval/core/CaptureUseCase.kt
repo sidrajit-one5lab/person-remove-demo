@@ -65,7 +65,7 @@ class CaptureUseCase(
         val holePx = stitch.fullHoleMask.count { it.toInt() != 0 }.coerceAtLeast(1)
         val actualFill = 1f - actualUnfilled.toFloat() / holePx
 
-        val classicalThreshold = 0.85f
+        val classicalThreshold = 0.90f
         val needsInpaint = actualUnfilled > 0
         val useLama = actualFill < classicalThreshold
 
@@ -79,27 +79,11 @@ class CaptureUseCase(
             filledRgb = cv ?: stitch.rgb
             inpaintMethod = if (cv == null) "none-failed" else "opencv-ns-fast"
         } else {
-            // Pre-fill hole with neutral ring-mean color when fill is so low
-            // that LaMa would otherwise see person-tinted stitcher output
-            // around the hole and bake a recognizable silhouette into its
-            // result. Producing a smooth color blob is psychologically much
-            // less distracting than a ghost. Clone stitch.rgb first because
-            // finalize() still needs the original reference for Poisson
-            // seamless cloning across the full stitched boundary.
-            val lamaInput: ByteArray = if (actualFill < NEUTRALIZE_FILL_THRESHOLD) {
-                val neutralized = stitch.rgb.copyOf()
-                nativeSession.neutralizePreLama(
-                    neutralized, stitch.unfilledMask, stitch.width, stitch.height
-                )
-                neutralized
-            } else {
-                stitch.rgb
-            }
             var ok: ByteArray? = null
-            var method = if (lamaInput !== stitch.rgb) "lama+neutral" else "lama"
+            var method = "lama"
             lamaInpainter?.let { lama ->
                 try {
-                    ok = lama.inpaintGaps(lamaInput, stitch.unfilledMask,
+                    ok = lama.inpaintGaps(stitch.rgb, stitch.unfilledMask,
                                           stitch.width, stitch.height)
                 } catch (t: Throwable) {
                     Log.w(TAG, "LaMa inpaint threw, falling back", t)
@@ -124,6 +108,17 @@ class CaptureUseCase(
             stitch.rgb, filledRgb, stitch.unfilledMask,
             stitch.width, stitch.height
         ) ?: filledRgb
+
+        // Grain match the inpainted region as the final step. The LaMa/Telea
+        // fill is low-frequency and reads as a too-smooth patch against the
+        // grainy surround; injecting matched sensor noise lets it blend.
+        // Done AFTER finalize so the Poisson clone doesn't smooth it back out,
+        // and only on the inpaint path. Self-skips on clean/thin surrounds, so
+        // it never degrades a good capture.
+        if (useLama) {
+            nativeSession.textureLamaRegion(
+                polished, stitch.unfilledMask, stitch.width, stitch.height)
+        }
 
         val totalMs = System.currentTimeMillis() - t0
         // Report `actualFill` (recomputed above) instead of the raw native
@@ -153,6 +148,7 @@ class CaptureUseCase(
                 "$baseStatus  — tricky scene, try stepping out of frame for a few seconds and retake"
             else -> baseStatus
         }
+
         return PipelineResult(
             rgb = polished,
             width = stitch.width,
@@ -194,13 +190,5 @@ class CaptureUseCase(
 
     private companion object {
         const val TAG = "PRPipeline"
-        // Below this fill ratio, the unfilled hole is large enough that
-        // LaMa would otherwise produce a person-shaped ghost (the
-        // reference frame's still-visible subject tones leak into the
-        // model's input). Pre-fill the hole with a neutral ring-mean
-        // color first, so LaMa renders a smooth blob instead of a
-        // recognizable silhouette. 0.40 = roughly the point where the
-        // unfilled area exceeds typical LaMa "small gap" sweet spot.
-        const val NEUTRALIZE_FILL_THRESHOLD = 0.40f
     }
 }

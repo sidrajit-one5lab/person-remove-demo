@@ -6,7 +6,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import com.one5.personremoval.core.Person
 import com.one5.personremoval.core.PersonState
 
@@ -26,50 +25,40 @@ import com.one5.personremoval.core.PersonState
  */
 @Composable
 fun MaskOverlay(
+    modifier: Modifier = Modifier,
     persons: List<Person>,
     states: Map<Int, PersonState>,
     frameW: Int,
     frameH: Int,
     isFrontCamera: Boolean = false,
-    modifier: Modifier = Modifier
 ) {
     Canvas(modifier) {
         if (frameW == 0 || frameH == 0) return@Canvas
-        val sx = size.width / frameW.toFloat()
-        val sy = size.height / frameH.toFloat()
+        // Match PreviewView's default FILL_CENTER: scale the frame uniformly to
+        // fill the view, center-cropping the overflow axis. A FIT_XY stretch
+        // (independent sx/sy over the full frame) misaligns the boxes because
+        // the preview crops the overflow instead of squishing it — boxes drift
+        // sideways from the person they outline.
+        val scale = maxOf(size.width / frameW.toFloat(), size.height / frameH.toFloat())
+        val offsetX = (size.width - frameW * scale) / 2f
+        val offsetY = (size.height - frameH * scale) / 2f
 
         for (p in persons) {
-            val left = if (isFrontCamera) {
-                (frameW - p.bBox.right) * sx
-            } else {
-                p.bBox.left * sx
-            }
-            val top = p.bBox.top * sy
-            val w = (p.bBox.right - p.bBox.left) * sx
-            val h = (p.bBox.bottom - p.bBox.top) * sy
+            val frameLeft = if (isFrontCamera) (frameW - p.bBox.right) else p.bBox.left
+            val left = frameLeft * scale + offsetX
+            val top = p.bBox.top * scale + offsetY
+            val w = (p.bBox.right - p.bBox.left) * scale
+            val h = (p.bBox.bottom - p.bBox.top) * scale
 
-            when (states[p.trackId] ?: PersonState.KEEP) {
-                PersonState.KEEP -> {
-                    drawRect(
-                        color = Color.Green.copy(alpha = 0.7f),
-                        topLeft = Offset(left, top),
-                        size = Size(w, h),
-                        style = Stroke(width = 3f)
-                    )
-                }
-                PersonState.REMOVE -> {
-                    drawRect(
-                        color = Color.Red.copy(alpha = 0.35f),
-                        topLeft = Offset(left, top),
-                        size = Size(w, h)
-                    )
-                    drawRect(
-                        color = Color.Red,
-                        topLeft = Offset(left, top),
-                        size = Size(w, h),
-                        style = Stroke(width = 5f)
-                    )
-                }
+            // Boxes are hidden during normal runtime. Only a person the user
+            // has tapped (REMOVE) gets a translucent grey fill, so selection
+            // is the single piece of visual feedback on the preview.
+            if ((states[p.trackId] ?: PersonState.KEEP) == PersonState.REMOVE) {
+                drawRect(
+                    color = Color.Red.copy(alpha = 0.2f),
+                    topLeft = Offset(left, top),
+                    size = Size(w, h)
+                )
             }
         }
     }

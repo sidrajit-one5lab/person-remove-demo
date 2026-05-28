@@ -79,8 +79,8 @@ StitchResult stitch(
     int filled = 0;
     // Confidence buckets matching the spec's green/yellow/red visualization:
     //   0       → red    (no real samples — goes to AI inpaint)
-    //   1–2     → yellow (marginal, alignment artifacts likely)
-    //   3–9     → green  (solid)
+    //   1–4     → yellow (marginal: below kMinReliableSamples, marked unfilled)
+    //   5–9     → green  (solid)
     //   10+     → green  (high confidence)
     int hist0 = 0, hist14 = 0, hist59 = 0, hist10p = 0;
 
@@ -129,7 +129,7 @@ StitchResult stitch(
                 }
             }
 
-            // Prefer high-quality samples when at least 3 of them landed
+            // Prefer high-quality samples when at least 5 of them landed
             // here; otherwise use everything to keep coverage on sparse
             // captures. Both buckets are local references so downstream
             // medianInPlace operates on the chosen vector in place.
@@ -149,9 +149,9 @@ StitchResult stitch(
             else if (n <= 9) ++hist59;
             else ++hist10p;
 
-            // Adaptive routing: pixels with fewer than 3 samples have high
-            // variance — the median over 1–2 samples is essentially "whatever
-            // that one sample was," which on sparse buffers (fast/quiet
+            // Adaptive routing: pixels with fewer than 5 samples have high
+            // variance — the median over 1–4 samples is essentially "whatever
+            // those few samples were," which on sparse buffers (fast/quiet
             // captures, static subject + static camera) means visible
             // patches of unreliable content.
             //
@@ -161,7 +161,7 @@ StitchResult stitch(
             // fails and we fall back to the stitcher's output), but the
             // unfilled mask says "this pixel's value isn't trustworthy."
             //
-            // On good captures (10+ samples dominate, almost no 1–2 sample
+            // On good captures (10+ samples dominate, almost no 1–4 sample
             // pixels), this branch is rarely taken — no behavior change.
             // On sparse captures it's the difference between "patchy bad
             // median" and "consistent LaMa fill."

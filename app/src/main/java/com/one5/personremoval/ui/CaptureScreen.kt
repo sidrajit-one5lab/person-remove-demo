@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -37,6 +36,36 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.Dp
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material3.Icon
+import androidx.compose.runtime.remember
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Brush
+
+// Hide the Capture button until the ring buffer has at least this many frames.
+// On fresh open (and right after a camera flip / exposure-relock clear) the
+// buffer is empty, so a capture would stitch from nothing and dead-end on the
+// generic "hold steady / ask subject to step aside" message. Gating the button
+// on buffer fill removes that case entirely — the user can only capture once
+// frames actually exist.
+private const val CAPTURE_READY_MIN_FRAMES = 1
 
 @Composable
 fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
@@ -51,6 +80,7 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
     val bufSize by viewModel.bufSize.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()
     val personStates by viewModel.personStates.collectAsState()
+    val subjectHint by viewModel.subjectHint.collectAsState()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -146,33 +176,64 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
             )
         }
 
-        Text(
-            text = "Keep phone steady for better results",
-            color = Color.White.copy(alpha = 0.7f),
-            fontSize = 12.sp,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 100.dp)
-        )
+        // Live readiness hint: when a tapped (REMOVE) person is holding still,
+        // no clean background is being revealed behind them — prompt them to
+        // step aside. Driven by CaptureViewModel.subjectHint (tracker motion).
+        if (!isProcessing) {
+            subjectHint?.let { hint ->
+                Text(
+                    text = hint,
+                    color = Color.Black,
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 96.dp)
+                        .background(Color(0xF2FFC107), CircleShape)
+                        .padding(horizontal = 18.dp, vertical = 10.dp)
+                )
+            }
+        }
 
-        Row(
+        // Camera-style control bar: a gradient scrim with the steady hint
+        // stacked ABOVE a row holding the circular shutter (center) and the
+        // flip-camera icon (right) — so the hint never overlaps the shutter.
+        // The shutter only appears once the ring buffer has frames (an empty
+        // buffer can't produce a usable capture) and fades/scales in.
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 50.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color.Transparent, Color.Black.copy(alpha = 0.55f))
+                    )
+                )
+                .padding(top = 20.dp, bottom = 44.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Button(
-                enabled = !isProcessing,
-                onClick = { viewModel.onCapture() }
-            ) {
-                Text("Capture")
-            }
-            Button(
-                enabled = !isProcessing,
-                onClick = { viewModel.onFlipCamera() }
-            ) {
-                Text("Flip")
+            Text(
+                text = "Keep phone steady for better results",
+                color = Color.White.copy(alpha = 0.7f),
+                fontSize = 12.sp
+            )
+
+            Spacer(Modifier.height(20.dp))
+
+            Box(modifier = Modifier.fillMaxWidth()) {
+                if (bufSize >= CAPTURE_READY_MIN_FRAMES && !isProcessing) {
+                    ShutterButton(
+                        onClick = { viewModel.onCapture() },
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                }
+
+                FlipButton(
+                    enabled = !isProcessing,
+                    onClick = { viewModel.onFlipCamera() },
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 36.dp)
+                )
             }
         }
 
@@ -187,19 +248,125 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    CircularProgressIndicator(
-                        color = Color.White,
-                        strokeWidth = 3.dp,
-                        modifier = Modifier.size(44.dp)
-                    )
-                    Spacer(Modifier.height(16.dp))
-                    Text(
-                        text = "Processing…",
-                        color = Color.White,
-                        fontSize = 14.sp
-                    )
+                    GridLoader(color = Color.White, size = 64.dp)
                 }
             }
         }
+    }
+}
+
+/**
+ * 3×3 pulsing-dot loader, ported 1:1 from `assets/grid_anim.svg` (the SVG uses
+ * SMIL animation, which Android can't render at runtime — Coil would show only
+ * a static frame). Each dot's opacity cycles 1 → 0.2 → 1 over 1s, staggered by
+ * the same per-dot begin offsets as the SVG.
+ */
+@Composable
+private fun GridLoader(
+    modifier: Modifier = Modifier,
+    color: Color = Color.White,
+    size: Dp = 64.dp
+) {
+    // (cx, cy, beginMs) — coordinates in the SVG's 105×105 viewBox.
+    val dots = remember {
+        listOf(
+            Triple(12.5f, 12.5f, 0f),
+            Triple(12.5f, 52.5f, 100f),
+            Triple(52.5f, 12.5f, 300f),
+            Triple(52.5f, 52.5f, 600f),
+            Triple(92.5f, 12.5f, 800f),
+            Triple(92.5f, 52.5f, 400f),
+            Triple(12.5f, 92.5f, 700f),
+            Triple(52.5f, 92.5f, 500f),
+            Triple(92.5f, 92.5f, 200f),
+        )
+    }
+    val transition = rememberInfiniteTransition(label = "gridLoader")
+    val t by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "gridT"
+    )
+    Canvas(modifier.size(size)) {
+        val scale = this.size.minDimension / 105f
+        val r = 12.5f * scale
+        for ((cx, cy, beginMs) in dots) {
+            // Loop-phase for this dot; .mod keeps it in [0,1) for the begin offset.
+            val phase = (t - beginMs / 1000f).mod(1f)
+            // values="1;.2;1" linear ⇒ triangle wave between 1.0 and 0.2.
+            val alpha = 0.2f + 0.8f * kotlin.math.abs(2f * phase - 1f)
+            drawCircle(
+                color = color.copy(alpha = alpha),
+                radius = r,
+                center = Offset(cx * scale, cy * scale)
+            )
+        }
+    }
+}
+
+/**
+ * iOS-style shutter: a thin white outer ring with a solid white inner disc.
+ * The inner disc scales down on press for tactile feedback (no ripple — the
+ * shape itself is the affordance).
+ */
+@Composable
+private fun ShutterButton(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val innerScale by animateFloatAsState(
+        targetValue = if (pressed) 0.82f else 1f,
+        label = "shutterInner"
+    )
+    Box(
+        modifier = modifier
+            .size(78.dp)
+            .clip(CircleShape)
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                onClick = onClick
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            Modifier
+                .size(78.dp)
+                .border(width = 4.dp, color = Color.White, shape = CircleShape)
+        )
+        Box(
+            Modifier
+                .size(62.dp)
+                .scale(innerScale)
+                .clip(CircleShape)
+                .background(Color.White)
+        )
+    }
+}
+
+/** Circular translucent flip-camera button with a cameraswitch glyph. */
+@Composable
+private fun FlipButton(
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .size(54.dp)
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = 0.18f))
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Cameraswitch,
+            contentDescription = "Flip camera",
+            tint = Color.White,
+            modifier = Modifier.size(28.dp)
+        )
     }
 }

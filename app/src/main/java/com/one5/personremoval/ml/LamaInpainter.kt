@@ -11,6 +11,7 @@ import java.io.IOException
 import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.min
+import androidx.core.graphics.createBitmap
 
 /**
  * On-device LaMa inpainting via ONNX Runtime Mobile.
@@ -63,9 +64,7 @@ class LamaInpainter(
 
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
-
     private var outputScale: Float? = null
-
     private val cachedImgInputName: String
     private val cachedMaskInputName: String
     private val cachedOutputName: String
@@ -73,7 +72,6 @@ class LamaInpainter(
     init {
         val modelPath = ensureModelOnDisk(context, modelAsset)
         session = createSession(listOf(modelPath))
-
         val inputNames = session.inputNames.toList()
         val outputNames = session.outputNames.toList()
         if (INPUT_IMG in inputNames && INPUT_MASK in inputNames) {
@@ -629,7 +627,7 @@ class LamaInpainter(
     }
 
     private fun rgbBytesToBitmap(rgb: ByteArray, w: Int, h: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val bmp = createBitmap(w, h)
         if (com.one5.personremoval.core.NativeSession.fillBitmapFromRgb(rgb, w, h, bmp)) {
             return bmp
         }

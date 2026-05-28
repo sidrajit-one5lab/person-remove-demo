@@ -17,6 +17,7 @@ import com.one5.personremoval.core.CaptureUseCase
 import com.one5.personremoval.core.DetectionResult
 import com.one5.personremoval.core.GallerySaver
 import com.one5.personremoval.core.NativeSession
+import com.one5.personremoval.core.Person
 import com.one5.personremoval.core.PersonState
 import com.one5.personremoval.core.Tracker
 import com.one5.personremoval.ml.YoloSegmenter
@@ -88,6 +89,15 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
     private val _isProcessing = MutableStateFlow(false)
     val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
+
+    // Live "ask the subject to step aside" hint. Non-null when a tapped
+    // (REMOVE) person has held still long enough that no clean background is
+    // being revealed behind them. Cleared once they move or are deselected.
+    private val _subjectHint = MutableStateFlow<String?>(null)
+    val subjectHint: StateFlow<String?> = _subjectHint.asStateFlow()
+
+    // Per-REMOVE-track bbox-center history (timeMs, cx, cy) for the hint above.
+    private val removeMotionHistory = HashMap<Int, ArrayDeque<Triple<Long, Float, Float>>>()
 
     private val _toastEvents = MutableSharedFlow<ToastEvent>(extraBufferCapacity = 1)
     val toastEvents: SharedFlow<ToastEvent> = _toastEvents.asSharedFlow()
@@ -166,6 +176,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
                     _personStates.value = states
+                    updateSubjectHint(tracked, states, raw.sourceWidth, nowMs)
                     checkMotionRelock(rot)
                 }
             }
@@ -175,6 +186,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             _cameraSelector.drop(1).collect { selector ->
                 cameraManager.rebind(selector)
                 nativeSession.clearBuffer()
+                _bufSize.value = 0
                 tracker.reset()
                 _stitchPreview.value = null
                 _personStates.value = emptyMap()
@@ -199,13 +211,22 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     fun onTap(offsetX: Float, offsetY: Float, canvasWidth: Int, canvasHeight: Int) {
         val d = _detection.value ?: return
         if (d.sourceWidth == 0 || d.sourceHeight == 0) return
+        if (canvasWidth == 0 || canvasHeight == 0) return
 
-        val sx = d.sourceWidth.toFloat() / canvasWidth
-        val sy = d.sourceHeight.toFloat() / canvasHeight
+        // Inverse of PreviewView's FILL_CENTER mapping (uniform scale +
+        // center-crop). Must mirror MaskOverlay so a tap lands on the same
+        // pixel the box is drawn over; a plain source/canvas ratio (FIT_XY) is
+        // off because the preview crops the overflow axis rather than squishing.
+        val scale = maxOf(
+            canvasWidth.toFloat() / d.sourceWidth,
+            canvasHeight.toFloat() / d.sourceHeight
+        )
+        val offX = (canvasWidth - d.sourceWidth * scale) / 2f
+        val offY = (canvasHeight - d.sourceHeight * scale) / 2f
+        val rawX = ((offsetX - offX) / scale).toInt().coerceIn(0, d.sourceWidth - 1)
         val isFront = _cameraSelector.value == CameraSelector.DEFAULT_FRONT_CAMERA
-        val rawX = (offsetX * sx).toInt().coerceIn(0, d.sourceWidth - 1)
         val fx = if (isFront) d.sourceWidth - 1 - rawX else rawX
-        val fy = (offsetY * sy).toInt().coerceIn(0, d.sourceHeight - 1)
+        val fy = ((offsetY - offY) / scale).toInt().coerceIn(0, d.sourceHeight - 1)
         val idx = fy * d.sourceWidth + fx
 
         var best = -1
@@ -306,6 +327,55 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /**
+     * Live "ask the subject to step aside" hint. For each REMOVE-marked person
+     * we track the bbox center; if it hasn't moved more than
+     * [SUBJECT_MOTION_FRACTION] of the frame width over the last
+     * [SUBJECT_STATIC_WINDOW_MS], the subject is holding still → no clean
+     * background is being revealed behind them, so we surface the hint. It
+     * clears the moment they move (or are deselected). Cheap: bbox centers from
+     * the tracker, no native work, runs in the analyzer loop.
+     */
+    private fun updateSubjectHint(
+        tracked: List<Person>,
+        states: Map<Int, PersonState>,
+        sourceWidth: Int,
+        nowMs: Long
+    ) {
+        val removePersons = tracked.filter {
+            (states[it.trackId] ?: PersonState.KEEP) == PersonState.REMOVE
+        }
+        if (removePersons.isEmpty() || sourceWidth <= 0) {
+            removeMotionHistory.clear()
+            _subjectHint.value = null
+            return
+        }
+        removeMotionHistory.keys.retainAll(removePersons.map { it.trackId }.toHashSet())
+
+        val motionThresholdPx = sourceWidth * SUBJECT_MOTION_FRACTION
+        var anyStatic = false
+        for (p in removePersons) {
+            val cx = (p.bBox.left + p.bBox.right) / 2f
+            val cy = (p.bBox.top + p.bBox.bottom) / 2f
+            val hist = removeMotionHistory.getOrPut(p.trackId) { ArrayDeque() }
+            hist.addLast(Triple(nowMs, cx, cy))
+            while (hist.size > 1 && nowMs - hist.first().first > SUBJECT_HISTORY_MS) {
+                hist.removeFirst()
+            }
+            // Only judge "static" once we have a full window of history.
+            if (nowMs - hist.first().first >= SUBJECT_STATIC_WINDOW_MS) {
+                val (_, fx, fy) = hist.first()
+                var maxD = 0f
+                for ((_, hx, hy) in hist) {
+                    val d = kotlin.math.hypot(hx - fx, hy - fy)
+                    if (d > maxD) maxD = d
+                }
+                if (maxD < motionThresholdPx) anyStatic = true
+            }
+        }
+        _subjectHint.value = if (anyStatic) "Ask the subject to step aside" else null
+    }
+
     private fun checkMotionRelock(currentRotation: FloatArray?) {
         if (nativeSession.frozen) return
         val locked = lockedRotation ?: return
@@ -337,6 +407,12 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         private const val STILLNESS_THRESHOLD_RAD_PER_SEC = 0.15f
         private const val STILLNESS_MAX_WAIT_MS = 500L
         private const val STILLNESS_POLL_MS = 25L
+        // "Ask subject to step aside" live hint: a REMOVE person is treated as
+        // static if their bbox center moves < SUBJECT_MOTION_FRACTION of frame
+        // width over SUBJECT_STATIC_WINDOW_MS. SUBJECT_HISTORY_MS = retention.
+        private const val SUBJECT_MOTION_FRACTION = 0.04f
+        private const val SUBJECT_STATIC_WINDOW_MS = 1200L
+        private const val SUBJECT_HISTORY_MS = 2000L
     }
 }
 
