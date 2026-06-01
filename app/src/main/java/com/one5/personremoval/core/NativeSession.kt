@@ -100,7 +100,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         removeMask: ByteArray,
         maskWidth: Int,
         maskHeight: Int,
-        removeTrackIds: IntArray = intArrayOf()
+        removeTrackIds: IntArray = intArrayOf(),
+        keepTrackIds: IntArray = intArrayOf()
     ): StitchOutput? = opLock.withLock {
         if (handle == 0L) return@withLock null
         // outArr: [0]=rgb, [1]=originalRgb, [2]=unfilledMask, [3]=fullHoleMask,
@@ -108,7 +109,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         val outArr = arrayOfNulls<Any>(6)
         @Suppress("UNCHECKED_CAST")
         val ok = nativeStitchForInpaint(
-            handle, removeMask, maskWidth, maskHeight, removeTrackIds, outArr as Array<Any?>
+            handle, removeMask, maskWidth, maskHeight,
+            removeTrackIds, keepTrackIds, outArr as Array<Any?>
         )
         if (!ok) return@withLock null
         val rgb         = outArr[0] as? ByteArray ?: return@withLock null
@@ -238,6 +240,7 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
             handle: Long,
             removeMask: ByteArray, maskW: Int, maskH: Int,
             removeTrackIds: IntArray,
+            keepTrackIds: IntArray,
             out: Array<Any?>
         ): Boolean
         @JvmStatic private external fun nativeOpencvInpaint(

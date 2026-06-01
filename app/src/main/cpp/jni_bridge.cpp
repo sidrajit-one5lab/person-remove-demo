@@ -292,6 +292,7 @@ namespace {
 bool runStitchForInpaint(Session* s, JNIEnv* env,
                          jbyteArray jRemoveMask, jint maskW, jint maskH,
                          jintArray jRemoveTrackIds,
+                         jintArray jKeepTrackIds,
                          jobjectArray outArr) {
     auto snap = s->buffer->snapshot();
     if (snap.empty()) {
@@ -389,8 +390,9 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         cv::dilate(dilatedHole, dilatedHole, shadowKern);
     }
 
-    // Parse REMOVE track IDs so we can rebuild per-frame person masks to
-    // exclude only REMOVE persons. KEEP persons become valid background.
+    // Parse REMOVE + KEEP track IDs. The REMOVE set gates whether we rebuild
+    // the exclusion masks at all; the KEEP set decides which person pixels may
+    // still serve as background (see the rebuild below).
     std::unordered_set<int> removeIds;
     if (jRemoveTrackIds != nullptr) {
         jsize idCount = env->GetArrayLength(jRemoveTrackIds);
@@ -398,6 +400,15 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
         if (idPtr) {
             for (jsize i = 0; i < idCount; ++i) removeIds.insert(idPtr[i]);
             env->ReleaseIntArrayElements(jRemoveTrackIds, idPtr, JNI_ABORT);
+        }
+    }
+    std::unordered_set<int> keepIds;
+    if (jKeepTrackIds != nullptr) {
+        jsize kc = env->GetArrayLength(jKeepTrackIds);
+        jint* kp = env->GetIntArrayElements(jKeepTrackIds, nullptr);
+        if (kp) {
+            for (jsize i = 0; i < kc; ++i) keepIds.insert(kp[i]);
+            env->ReleaseIntArrayElements(jKeepTrackIds, kp, JNI_ABORT);
         }
     }
 
@@ -426,24 +437,34 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     }
     auto aligned = alignToReference(reference, snap);
 
-    // Replace each aligned frame's anyPersonMask with REMOVE-only version.
-    // The aligner already used the full anyPersonMask for feature masking
-    // (correct: we don't want keypoints on ANY person). Now the stitcher
-    // needs to know which pixels are REMOVE-person (skip) vs KEEP-person
-    // (valid background). KEEP person pixels become usable samples.
+    // Rebuild each aligned frame's background-exclusion mask. The aligner
+    // already used the full anyPersonMask for feature masking (correct: no
+    // keypoints on ANY person). Now the stitcher needs to know which person
+    // pixels may still serve as background.
+    //
+    // Rule: exclude any person whose track id is NOT a current KEEP id. That
+    // covers the REMOVE target AND — critically — any stale-track instance of
+    // a person who left the frame for >1s and returned with a fresh id
+    // (Tracker.maxGapMs drops the old track). Those earlier frames still sit
+    // in the ring buffer carrying the OLD id, which is neither the current
+    // REMOVE id nor a KEEP id. The old "exclude only REMOVE ids" rule treated
+    // them as valid background, so the departed subject leaked back into the
+    // temporal median as a translucent ghost. Excluding by "not KEEP" closes
+    // that leak while still admitting genuine KEEP persons, so overlapping
+    // people (remove the front one, reveal the kept one behind) still work.
     if (!removeIds.empty()) {
         const cv::Size refSize = reference.image.size();
         for (auto& af : aligned) {
             if (!af.valid) continue;
-            cv::Mat removeOnly = cv::Mat::zeros(refSize, CV_8UC1);
+            cv::Mat excludeMask = cv::Mat::zeros(refSize, CV_8UC1);
             const size_t nm = std::min(af.personMasks.size(),
                                        af.personTrackIds.size());
             for (size_t mi = 0; mi < nm; ++mi) {
-                if (removeIds.count(af.personTrackIds[mi])) {
-                    cv::bitwise_or(removeOnly, af.personMasks[mi], removeOnly);
+                if (keepIds.count(af.personTrackIds[mi]) == 0) {
+                    cv::bitwise_or(excludeMask, af.personMasks[mi], excludeMask);
                 }
             }
-            af.anyPersonMask = removeOnly;
+            af.anyPersonMask = excludeMask;
         }
     }
 
@@ -550,13 +571,15 @@ Java_com_one5_personremoval_core_NativeSession_nativeStitchForInpaint(
         JNIEnv* env, jclass /*clazz*/, jlong handle,
         jbyteArray removeMask, jint maskW, jint maskH,
         jintArray removeTrackIds,
+        jintArray keepTrackIds,
         jobjectArray outArr) {
     auto* s = asSession(handle);
     if (!s) return JNI_FALSE;
     if (!outArr || env->GetArrayLength(outArr) < 6) return JNI_FALSE;
     if (!removeMask || maskW <= 0 || maskH <= 0) return JNI_FALSE;
     if (env->GetArrayLength(removeMask) < (jsize)((size_t)maskW * maskH)) return JNI_FALSE;
-    return runStitchForInpaint(s, env, removeMask, maskW, maskH, removeTrackIds, outArr) ? JNI_TRUE : JNI_FALSE;
+    return runStitchForInpaint(s, env, removeMask, maskW, maskH,
+                               removeTrackIds, keepTrackIds, outArr) ? JNI_TRUE : JNI_FALSE;
 }
 
 /**

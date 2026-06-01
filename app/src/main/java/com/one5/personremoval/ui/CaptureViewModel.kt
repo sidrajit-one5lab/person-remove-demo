@@ -96,6 +96,13 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
     private val _subjectHint = MutableStateFlow<String?>(null)
     val subjectHint: StateFlow<String?> = _subjectHint.asStateFlow()
 
+    // Live parallax coach. Reads the gyro + tracked subject and tells the user
+    // to pan (reveal real background), confirms when ready, or asks a
+    // frame-filling subject to step aside. Replaces the old static
+    // "keep phone steady" instruction, which defeated the multi-frame stitch.
+    private val parallaxCoach = ParallaxCoach()
+    val parallaxState: StateFlow<ParallaxCoach.State> = parallaxCoach.state
+
     // Per-REMOVE-track bbox-center history (timeMs, cx, cy) for the hint above.
     private val removeMotionHistory = HashMap<Int, ArrayDeque<Triple<Long, Float, Float>>>()
 
@@ -120,6 +127,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         cameraManager.onExposureLocked = {
             nativeSession.clearBuffer()
             _bufSize.value = 0
+            // Buffer just flushed: restart sweep accumulation so the coach
+            // measures parallax from the post-lock frames the stitch will use.
+            parallaxCoach.reset()
             lockedRotation = if (gyroIntegrator.isAvailable) gyroIntegrator.snapshot() else null
             lastRelockMs = System.currentTimeMillis()
         }
@@ -176,7 +186,15 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     _bufSize.value = nativeSession.bufferSize()
                     _detection.value = raw.copy(persons = tracked)
                     _personStates.value = states
-                    updateSubjectHint(tracked, states, raw.sourceWidth, nowMs)
+                    val removeSummary = updateSubjectHint(
+                        tracked, states, raw.sourceWidth, raw.sourceHeight, nowMs)
+                    parallaxCoach.onFrame(
+                        rotation = rot,
+                        hasRemoveTarget = removeSummary.hasTarget,
+                        subjectStatic = removeSummary.anyStatic,
+                        largestAreaFrac = removeSummary.largestAreaFrac,
+                        nowMs = nowMs
+                    )
                     checkMotionRelock(rot)
                 }
             }
@@ -188,6 +206,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 nativeSession.clearBuffer()
                 _bufSize.value = 0
                 tracker.reset()
+                parallaxCoach.reset()
                 _stitchPreview.value = null
                 _personStates.value = emptyMap()
             }
@@ -296,7 +315,7 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                     null to "no detection yet"
                 }
                 if (result == null) {
-                    _toastEvents.tryEmit(ToastEvent(status))
+                    _toastEvents.tryEmit(ToastEvent(status, long = "retake" in status))
                     _lastResultText.value = status
                     return@launch
                 }
@@ -310,16 +329,16 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
                 val bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
 
                 val isTricky = "tricky scene" in status
-                val keepSteady = "keep phone steady" in status
+                val needsRetake = "retake" in status
                 val toastMsg = when {
                     uri == null -> "Save failed"
-                    keepSteady -> "Saved — keep phone steady, ask subject to step aside"
                     isTricky -> "Saved — tricky scene, try stepping out of frame and retake"
+                    needsRetake -> "Saved — for a cleaner result, pan slightly or ask the subject to step aside, then retake"
                     else -> "Saved to Gallery"
                 }
                 _stitchPreview.value = bmp
                 _lastResultText.value = status
-                _toastEvents.tryEmit(ToastEvent(toastMsg, long = isTricky || keepSteady))
+                _toastEvents.tryEmit(ToastEvent(toastMsg, long = isTricky || needsRetake))
             } finally {
                 nativeSession.frozen = false
                 _isProcessing.value = false
@@ -340,23 +359,28 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
         tracked: List<Person>,
         states: Map<Int, PersonState>,
         sourceWidth: Int,
+        sourceHeight: Int,
         nowMs: Long
-    ) {
+    ): RemoveSummary {
         val removePersons = tracked.filter {
             (states[it.trackId] ?: PersonState.KEEP) == PersonState.REMOVE
         }
-        if (removePersons.isEmpty() || sourceWidth <= 0) {
+        if (removePersons.isEmpty() || sourceWidth <= 0 || sourceHeight <= 0) {
             removeMotionHistory.clear()
             _subjectHint.value = null
-            return
+            return RemoveSummary(hasTarget = false, anyStatic = false, largestAreaFrac = 0f)
         }
         removeMotionHistory.keys.retainAll(removePersons.map { it.trackId }.toHashSet())
 
         val motionThresholdPx = sourceWidth * SUBJECT_MOTION_FRACTION
+        val frameArea = (sourceWidth.toLong() * sourceHeight).toFloat()
         var anyStatic = false
+        var largestAreaFrac = 0f
         for (p in removePersons) {
             val cx = (p.bBox.left + p.bBox.right) / 2f
             val cy = (p.bBox.top + p.bBox.bottom) / 2f
+            val areaFrac = (p.bBox.width() * p.bBox.height() / frameArea).coerceIn(0f, 1f)
+            if (areaFrac > largestAreaFrac) largestAreaFrac = areaFrac
             val hist = removeMotionHistory.getOrPut(p.trackId) { ArrayDeque() }
             hist.addLast(Triple(nowMs, cx, cy))
             while (hist.size > 1 && nowMs - hist.first().first > SUBJECT_HISTORY_MS) {
@@ -374,7 +398,19 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
             }
         }
         _subjectHint.value = if (anyStatic) "Ask the subject to step aside" else null
+        return RemoveSummary(
+            hasTarget = true,
+            anyStatic = anyStatic,
+            largestAreaFrac = largestAreaFrac
+        )
     }
+
+    /** Per-frame summary of the removal targets, used to drive the coach. */
+    private data class RemoveSummary(
+        val hasTarget: Boolean,
+        val anyStatic: Boolean,
+        val largestAreaFrac: Float
+    )
 
     private fun checkMotionRelock(currentRotation: FloatArray?) {
         if (nativeSession.frozen) return

@@ -149,23 +149,30 @@ StitchResult stitch(
             else if (n <= 9) ++hist59;
             else ++hist10p;
 
-            // Adaptive routing: pixels with fewer than 5 samples have high
-            // variance — the median over 1–4 samples is essentially "whatever
-            // those few samples were," which on sparse buffers (fast/quiet
-            // captures, static subject + static camera) means visible
-            // patches of unreliable content.
+            // Adaptive routing: a pixel needs at least kMinReliableSamples
+            // background observations before we trust its temporal median.
             //
-            // Mark them as "unfilled" so the downstream LaMa/Telea path
-            // covers them with hallucinated content of consistent quality.
-            // Still write the median as a *prior* (in case the AI inpaint
-            // fails and we fall back to the stitcher's output), but the
-            // unfilled mask says "this pixel's value isn't trustworthy."
+            // The floor trades two failure modes against each other:
+            //   - Too high  -> real background that only a few frames glimpsed
+            //                  (thin slivers from hand-shake, a briefly-static
+            //                  subject) is discarded and handed to the AI
+            //                  inpainter, which invents instead of using the
+            //                  real pixels we actually captured.
+            //   - Too low   -> a 1–2 sample median is "whatever those samples
+            //                  were," so a single drift sample (a person
+            //                  passing through that pixel) leaks into the fill
+            //                  as a ghost, with no outlier to vote it down.
             //
-            // On good captures (10+ samples dominate, almost no 1–4 sample
-            // pixels), this branch is rarely taken — no behavior change.
-            // On sparse captures it's the difference between "patchy bad
-            // median" and "consistent LaMa fill."
-            constexpr int kMinReliableSamples = 5;
+            // 3 is the floor: a 3-sample median still rejects one stray drift
+            // sample, while recovering the real-background band that the old
+            // floor of 5 threw away. Real pixels beat hallucination wherever
+            // we have even a few of them.
+            //
+            // Pixels below the floor are marked "unfilled" so the downstream
+            // LaMa/Telea path covers them with consistent-quality content. We
+            // still write the sparse median as a *prior* in case the AI
+            // inpaint fails and we fall back to the stitcher's output.
+            constexpr int kMinReliableSamples = 3;
             if (n < kMinReliableSamples) {
                 unfilledRow[x] = 255;
                 if (n > 0) {

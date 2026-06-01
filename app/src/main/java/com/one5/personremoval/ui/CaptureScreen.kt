@@ -80,7 +80,7 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
     val bufSize by viewModel.bufSize.collectAsState()
     val isProcessing by viewModel.isProcessing.collectAsState()
     val personStates by viewModel.personStates.collectAsState()
-    val subjectHint by viewModel.subjectHint.collectAsState()
+    val parallaxState by viewModel.parallaxState.collectAsState()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -176,22 +176,17 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
             )
         }
 
-        // Live readiness hint: when a tapped (REMOVE) person is holding still,
-        // no clean background is being revealed behind them — prompt them to
-        // step aside. Driven by CaptureViewModel.subjectHint (tracker motion).
+        // Live parallax coach: nudges the user to pan (reveal real background),
+        // confirms when ready, or asks a frame-filling subject to step aside.
+        // Replaces the old static "hold steady" guidance, which defeated the
+        // multi-frame stitch. Driven by CaptureViewModel.parallaxState.
         if (!isProcessing) {
-            subjectHint?.let { hint ->
-                Text(
-                    text = hint,
-                    color = Color.Black,
-                    fontSize = 14.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 96.dp)
-                        .background(Color(0xF2FFC107), CircleShape)
-                        .padding(horizontal = 18.dp, vertical = 10.dp)
-                )
-            }
+            ParallaxCoachOverlay(
+                state = parallaxState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 96.dp)
+            )
         }
 
         // Camera-style control bar: a gradient scrim with the steady hint
@@ -212,7 +207,7 @@ fun CaptureScreen(viewModel: CaptureViewModel = viewModel()) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "Keep phone steady for better results",
+                text = "Move slowly to capture the background behind",
                 color = Color.White.copy(alpha = 0.7f),
                 fontSize = 12.sp
             )
