@@ -11,7 +11,7 @@ import kotlinx.coroutines.launch
 /**
  * Application entry point. Owns the app-scoped [MlRepository] and kicks off
  * eager model preloading on process start so the user doesn't pay the
- * ~1–2s LaMa load cost on their first capture.
+ * MI-GAN load cost on their first capture.
  *
  * Wired into [AndroidManifest.xml] via `android:name=".PersonRemovalApp"`.
  *
@@ -57,8 +57,8 @@ class PersonRemovalApp : Application() {
      */
     private fun logAssetAvailability() {
         val checks = listOf(
-            "yolov8n-seg.tflite" to "YOLO segmenter",
-            "lama.onnx"          to "LaMa inpainter"
+            "yolov8n-seg.tflite"     to "YOLO segmenter",
+            "migan_pipeline_v2.onnx" to "MI-GAN inpainter"
         )
         for ((file, label) in checks) {
             val present = try { assets.openFd(file).use { true } } catch (_: Throwable) {

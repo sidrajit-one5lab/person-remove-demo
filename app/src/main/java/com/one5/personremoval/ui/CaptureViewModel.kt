@@ -111,7 +111,9 @@ class CaptureViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         viewModelScope.launch {
-            captureUseCase.lamaInpainter = mlRepository.lama()
+            // MI-GAN is the fill engine (fast single forward pass); the pipeline
+            // falls back to classical OpenCV if it's unavailable.
+            captureUseCase.miganInpainter = mlRepository.migan()
         }
         // Start gyro accumulation. The rotation matrix resets here so all
         // subsequent buffer frames are expressed in a common reference

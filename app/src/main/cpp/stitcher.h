@@ -33,76 +33,21 @@ struct StitchResult {
 };
 
 /**
- * Stage 5 (lighting / exposure drift): shift the stitched region's mean color
- * to match the reference's mean color in a band just outside the hole.
- * Corrects uniform tint (e.g. AWB drift across the buffer window) without
- * touching gradients — sharp detail in the patch is preserved.
- *
- * NOTE on [bandPx]: a too-narrow band hugs the very edge of the dilation
- * halo, where local variations (shadow gradient at the wall-meets-ceiling
- * line, paint subtleties, mirror reflection edges) get over-represented in
- * the mean and can produce a residual chromatic shift inside the patch. A
- * wider band averages over more of the surrounding region — more stable
- * mean, less likely to bias one channel asymmetrically.
- *
- * Operates in place on [stitched]. Outside [holeMask] the image is untouched.
- *
- * SUPERSEDED by multiBandBlendStitch() for large multi-region holes. The
- * constant-offset shift causes a visible "bright box" at the hole shape when
- * inner/outer ring samples disagree. Kept for narrow holes where multi-band
- * pyramid construction is unstable.
- */
-void matchStitchToReferenceTint(
-        cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        int bandPx = 16);
-
-/**
  * Multi-band (Laplacian pyramid) blend: fuses the patched hole region with the
  * reference outside the hole using cv::detail::MultiBandBlender. The pyramid
  * decomposes both images into spatial frequency bands and blends each band
  * separately, so low-frequency mean/tint differences match the surroundings
  * naturally while high-frequency texture inside the hole is preserved.
  *
- * Replaces matchStitchToReferenceTint (constant offset) and
- * featherStitchBoundary (gaussian alpha seam) for typical large-hole captures.
- * Works correctly across multi-region holes where a constant offset would
- * produce a visible bright/dark patch.
+ * Handles multi-region holes correctly, where a constant tint offset would
+ * produce a visible bright/dark patch at the hole shape.
  *
- * Operates in place on [stitched]. No-op on OpenCV exception (caller can apply
- * legacy seam ops as backup).
+ * Operates in place on [stitched]. No-op on OpenCV exception.
  */
 void multiBandBlendStitch(
         cv::Mat& stitched,
         const cv::Mat& reference,
         const cv::Mat& holeMask);
-
-/**
- * Stage 6 (seam blending): gaussian-feathered alpha-blend across the hole
- * boundary. Stitched pixels deep inside the hole and reference pixels far
- * outside remain unchanged; only a ~bandPx-wide annulus around the boundary
- * gets blended. With the removal mask dilated outward, the reference values
- * sampled inside the feather band are already background (not person), so no
- * person silhouette leaks back in.
- *
- * Operates in place on [stitched].
- *
- * NOTE on [bandPx]: must stay strictly under the removal-mask dilation radius
- * used in the JNI bridge. The feather pulls reference values from up to
- * bandPx pixels inside the hole; if that distance exceeds the dilation
- * radius, the feather would start blending in actual person pixels. With
- * the current 30-px dilation, 15 is the safe maximum.
- *
- * Wider bands hide boundary-line artifacts much better on smooth surfaces
- * (uniform walls / sky) where the eye can pin a discontinuity to a single
- * row of pixels. On textured surfaces the band width barely matters.
- */
-void featherStitchBoundary(
-        cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        int bandPx = 15);
 
 /**
  * Unsharp mask, applied only inside the hole. Restores high-frequency detail
@@ -149,19 +94,6 @@ void matchNoiseToReferenceSurround(
         const cv::Mat& reference,
         const cv::Mat& holeMask,
         int bandPx = 10);
-
-/**
- * Post-stitch ghost detector. Compares luminance of filled pixels inside the
- * hole against the reference band just outside. Pixels that deviate
- * significantly are flagged as unfilled so LaMa/NS replaces them.
- */
-void detectGhostPixels(
-        const cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        const cv::Mat& personMask,
-        cv::Mat& unfilled,
-        const cv::Mat& sampleCount);
 
 /**
  * Temporal-median stitcher.

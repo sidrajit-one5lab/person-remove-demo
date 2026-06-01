@@ -279,13 +279,12 @@ namespace {
 
 /**
  * Helper: align + stitch using the caller-supplied REMOVE hole mask. Populates
- * a 6-slot java.lang.Object[]:
- *   [0] = byte[] stitched RGB           (w*h*3) — reference with hole filled by real samples
- *   [1] = byte[] original reference RGB (w*h*3) — pre-stitch (needed by finalize for seamless cloning)
- *   [2] = byte[] unfilled mask          (w*h, 255 = LaMa should fill)
- *   [3] = byte[] full hole mask         (w*h, 255 = blender should cross-blend) — already dilated
- *   [4] = int[]{w, h}
- *   [5] = float[]{fillRatio}
+ * a 5-slot java.lang.Object[]:
+ *   [0] = byte[] stitched RGB    (w*h*3) — reference with hole filled by real samples
+ *   [1] = byte[] unfilled mask   (w*h, 255 = LaMa should fill)
+ *   [2] = byte[] full hole mask  (w*h, 255 = blender should cross-blend) — already dilated
+ *   [3] = int[]{w, h}
+ *   [4] = float[]{fillRatio, noSampleRatio}
  *
  * Returns true on success.
  */
@@ -522,18 +521,15 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     // Allocate all 6 outputs up front; bail if any fail (Java refs leak only as
     // local refs and are cleaned up on JNI return).
     jbyteArray jrgb       = env->NewByteArray(static_cast<jsize>(rgbLen));
-    jbyteArray joriginal  = env->NewByteArray(static_cast<jsize>(rgbLen));
     jbyteArray junfilled  = env->NewByteArray(static_cast<jsize>(maskLen));
     jbyteArray jhole      = env->NewByteArray(static_cast<jsize>(maskLen));
     jintArray  jdims      = env->NewIntArray(2);
     // [0] = realFillRatio, [1] = noSampleRatio (hist0 / totalHole).
     jfloatArray jratio    = env->NewFloatArray(2);
-    if (!jrgb || !joriginal || !junfilled || !jhole || !jdims || !jratio) return false;
+    if (!jrgb || !junfilled || !jhole || !jdims || !jratio) return false;
 
     env->SetByteArrayRegion(jrgb, 0, static_cast<jsize>(rgbLen),
                             reinterpret_cast<const jbyte*>(result.image.data));
-    env->SetByteArrayRegion(joriginal, 0, static_cast<jsize>(rgbLen),
-                            reinterpret_cast<const jbyte*>(reference.image.data));
     if (!result.stillUnfilled.empty()) {
         env->SetByteArrayRegion(junfilled, 0, static_cast<jsize>(maskLen),
                                 reinterpret_cast<const jbyte*>(result.stillUnfilled.data));
@@ -547,11 +543,10 @@ bool runStitchForInpaint(Session* s, JNIEnv* env,
     env->SetFloatArrayRegion(jratio, 0, 2, ratios);
 
     env->SetObjectArrayElement(outArr, 0, jrgb);
-    env->SetObjectArrayElement(outArr, 1, joriginal);
-    env->SetObjectArrayElement(outArr, 2, junfilled);
-    env->SetObjectArrayElement(outArr, 3, jhole);
-    env->SetObjectArrayElement(outArr, 4, jdims);
-    env->SetObjectArrayElement(outArr, 5, jratio);
+    env->SetObjectArrayElement(outArr, 1, junfilled);
+    env->SetObjectArrayElement(outArr, 2, jhole);
+    env->SetObjectArrayElement(outArr, 3, jdims);
+    env->SetObjectArrayElement(outArr, 4, jratio);
     return true;
 }
 
@@ -575,7 +570,7 @@ Java_com_one5_personremoval_core_NativeSession_nativeStitchForInpaint(
         jobjectArray outArr) {
     auto* s = asSession(handle);
     if (!s) return JNI_FALSE;
-    if (!outArr || env->GetArrayLength(outArr) < 6) return JNI_FALSE;
+    if (!outArr || env->GetArrayLength(outArr) < 5) return JNI_FALSE;
     if (!removeMask || maskW <= 0 || maskH <= 0) return JNI_FALSE;
     if (env->GetArrayLength(removeMask) < (jsize)((size_t)maskW * maskH)) return JNI_FALSE;
     return runStitchForInpaint(s, env, removeMask, maskW, maskH,
@@ -810,126 +805,6 @@ Java_com_one5_personremoval_ml_YoloSegmenter_nativeFillInputBuffer(
 }
 
 /**
- * In-place tint harmonization for the LaMa-filled region. Computes the
- * mean RGB shift between the unfilled mask interior and the 1-px ring of
- * real pixels immediately outside, then applies the (clamped) shift to
- * every masked pixel. Faithful port of CaptureUseCase.harmonizeLamaRegion;
- * the 41×41 mask-presence sampling on a 4-px grid is preserved verbatim.
- *
- * Cost on the Kotlin side was 150-250 ms (double full-image loop). The
- * native version drops it to ~5-15 ms — same algorithm, but raw pointer
- * loops + sequential RGB indexing keep it inside the L1 cache.
- */
-JNIEXPORT void JNICALL
-Java_com_one5_personremoval_core_NativeSession_nativeHarmonizeLamaRegion(
-        JNIEnv* env, jclass /*clazz*/,
-        jbyteArray rgb, jbyteArray mask, jint w, jint h) {
-    if (w <= 0 || h <= 0) return;
-    const size_t rgbLen  = static_cast<size_t>(w) * h * 3;
-    const size_t maskLen = static_cast<size_t>(w) * h;
-    if (env->GetArrayLength(rgb)  < (jsize)rgbLen)  return;
-    if (env->GetArrayLength(mask) < (jsize)maskLen) return;
-
-    jbyte* rgbPtr  = env->GetByteArrayElements(rgb, nullptr);
-    jbyte* maskPtr = env->GetByteArrayElements(mask, nullptr);
-    if (!rgbPtr || !maskPtr) {
-        if (rgbPtr)  env->ReleaseByteArrayElements(rgb, rgbPtr, JNI_ABORT);
-        if (maskPtr) env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
-        return;
-    }
-
-    auto* rgbU  = reinterpret_cast<uint8_t*>(rgbPtr);
-    auto* maskU = reinterpret_cast<const uint8_t*>(maskPtr);
-
-    constexpr int BAND_PX = 20;
-    int64_t innerR = 0, innerG = 0, innerB = 0, innerN = 0;
-    int64_t outerR = 0, outerG = 0, outerB = 0, outerN = 0;
-
-    for (int y = 0; y < h; ++y) {
-        const int rowBase = y * w;
-        for (int x = 0; x < w; ++x) {
-            const int i = rowBase + x;
-            if (maskU[i]) {
-                const int p = i * 3;
-                innerR += rgbU[p];
-                innerG += rgbU[p + 1];
-                innerB += rgbU[p + 2];
-                ++innerN;
-                continue;
-            }
-            const bool nearMask =
-                    (x > 0     && maskU[i - 1]) ||
-                    (x < w - 1 && maskU[i + 1]) ||
-                    (y > 0     && maskU[i - w]) ||
-                    (y < h - 1 && maskU[i + w]);
-            if (!nearMask) continue;
-            const int yLo = std::max(0, y - BAND_PX);
-            const int yHi = std::min(h - 1, y + BAND_PX);
-            const int xLo = std::max(0, x - BAND_PX);
-            const int xHi = std::min(w - 1, x + BAND_PX);
-            bool inBand = false;
-            for (int by = yLo; by <= yHi && !inBand; by += 4) {
-                const int br = by * w;
-                for (int bx = xLo; bx <= xHi; bx += 4) {
-                    if (maskU[br + bx]) { inBand = true; break; }
-                }
-            }
-            if (!inBand) continue;
-            const int p = i * 3;
-            outerR += rgbU[p];
-            outerG += rgbU[p + 1];
-            outerB += rgbU[p + 2];
-            ++outerN;
-        }
-    }
-
-    auto release = [&](){
-        env->ReleaseByteArrayElements(rgb,  rgbPtr,  0);  // commit rgb writes
-        env->ReleaseByteArrayElements(mask, maskPtr, JNI_ABORT);
-    };
-
-    if (outerN < 500 || innerN < 200) { release(); return; }
-
-    // Tone clamp widened 15 → 25: the fill on a low-fill hole is a flat blob
-    // whose mean can sit further off the surround than ±15. A wider cap lets
-    // the shift actually reach the surrounding tone (killing the visible
-    // silhouette) while still bounding a runaway correction from a bad ring
-    // measurement. Only captures whose mismatch exceeds 15 change at all;
-    // well-matched fills (diff < 15) are unaffected.
-    const auto clampTone = [](int v) {
-        return v < -25 ? -25 : (v > 25 ? 25 : v);
-    };
-    const int dr = clampTone(static_cast<int>(
-            static_cast<float>(outerR) / outerN -
-            static_cast<float>(innerR) / innerN));
-    const int dg = clampTone(static_cast<int>(
-            static_cast<float>(outerG) / outerN -
-            static_cast<float>(innerG) / innerN));
-    const int db = clampTone(static_cast<int>(
-            static_cast<float>(outerB) / outerN -
-            static_cast<float>(innerB) / innerN));
-
-    if (dr == 0 && dg == 0 && db == 0) { release(); return; }
-
-    LOGI("harmonize: shift R=%d G=%d B=%d (outer=%lld inner=%lld)",
-         dr, dg, db, (long long)outerN, (long long)innerN);
-
-    const auto clamp255 = [](int v) {
-        return v < 0 ? uint8_t(0) : (v > 255 ? uint8_t(255) : uint8_t(v));
-    };
-    const int n = w * h;
-    for (int i = 0; i < n; ++i) {
-        if (!maskU[i]) continue;
-        const int p = i * 3;
-        rgbU[p]     = clamp255(static_cast<int>(rgbU[p])     + dr);
-        rgbU[p + 1] = clamp255(static_cast<int>(rgbU[p + 1]) + dg);
-        rgbU[p + 2] = clamp255(static_cast<int>(rgbU[p + 2]) + db);
-    }
-
-    release();
-}
-
-/**
  * Post-fill grain match for the inpainted region. LaMa (and Telea) produce a
  * smooth, low-frequency fill; against the grainy real surround that reads as
  * an unnaturally clean patch the eye locks onto. This injects sensor noise
@@ -979,8 +854,8 @@ Java_com_one5_personremoval_core_NativeSession_nativeTextureLamaRegion(
  * Fill an existing ARGB_8888 bitmap from a packed RGB byte array. Bitmap
  * dimensions must match (w, h). Alpha is set to 0xFF for every pixel.
  * Uses AndroidBitmap_lockPixels + cv::cvtColor (SIMD on arm64). Replaces
- * the Kotlin Bitmap.setPixels(IntArray) path in LamaInpainter that
- * allocated an IntArray + per-pixel pack on every inpaint invocation.
+ * a Kotlin Bitmap.setPixels(IntArray) path that allocated an IntArray +
+ * per-pixel pack on every conversion.
  */
 JNIEXPORT jboolean JNICALL
 Java_com_one5_personremoval_core_NativeSession_nativeFillBitmapFromRgb(

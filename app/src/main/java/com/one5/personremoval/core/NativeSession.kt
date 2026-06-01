@@ -65,9 +65,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
      * Phase 9 entry: runs stitching and returns everything the Kotlin side needs
      * to drive both the inpaint stage and the final seamless-clone blend.
      *  - `rgb`           : stitched RGB (reference with hole filled by real samples)
-     *  - `originalRgb`   : raw reference RGB before stitching — used by finalize()
-     *                      so seamless cloning runs across the FULL stitched boundary
-     *                      (not just the LaMa boundary)
      *  - `unfilledMask`  : per-pixel byte; non-zero = the inpainter should fill
      *  - `fullHoleMask`  : the dilated hole used by the stitcher (full REMOVE region)
      *  - `width/height`  : image size
@@ -78,7 +75,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
      */
     data class StitchOutput(
         val rgb: ByteArray,
-        val originalRgb: ByteArray,
         val unfilledMask: ByteArray,
         val fullHoleMask: ByteArray,
         val width: Int,
@@ -104,9 +100,9 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         keepTrackIds: IntArray = intArrayOf()
     ): StitchOutput? = opLock.withLock {
         if (handle == 0L) return@withLock null
-        // outArr: [0]=rgb, [1]=originalRgb, [2]=unfilledMask, [3]=fullHoleMask,
-        //         [4]=int[]{w,h}, [5]=float[]{ratio}
-        val outArr = arrayOfNulls<Any>(6)
+        // outArr: [0]=rgb, [1]=unfilledMask, [2]=fullHoleMask,
+        //         [3]=int[]{w,h}, [4]=float[]{ratio, noSampleRatio}
+        val outArr = arrayOfNulls<Any>(5)
         @Suppress("UNCHECKED_CAST")
         val ok = nativeStitchForInpaint(
             handle, removeMask, maskWidth, maskHeight,
@@ -114,14 +110,13 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         )
         if (!ok) return@withLock null
         val rgb         = outArr[0] as? ByteArray ?: return@withLock null
-        val originalRgb = outArr[1] as? ByteArray ?: return@withLock null
-        val unfilled    = outArr[2] as? ByteArray ?: return@withLock null
-        val fullHole    = outArr[3] as? ByteArray ?: return@withLock null
-        val dims        = outArr[4] as? IntArray ?: return@withLock null
-        val ratio       = outArr[5] as? FloatArray ?: return@withLock null
+        val unfilled    = outArr[1] as? ByteArray ?: return@withLock null
+        val fullHole    = outArr[2] as? ByteArray ?: return@withLock null
+        val dims        = outArr[3] as? IntArray ?: return@withLock null
+        val ratio       = outArr[4] as? FloatArray ?: return@withLock null
         if (dims.size < 2 || ratio.size < 2) return@withLock null
         StitchOutput(
-            rgb, originalRgb, unfilled, fullHole,
+            rgb, unfilled, fullHole,
             dims[0], dims[1],
             fillRatio = ratio[0],
             noSampleRatio = ratio[1]
@@ -133,8 +128,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
     // nativeDestroy.
 
     /**
-     * Classical OpenCV inpaint (Telea). Fallback used when LaMa fails.
-     * Safe to call on any thread. Returns null on failure.
+     * Classical OpenCV inpaint (Navier-Stokes, cv::INPAINT_NS). Fallback when
+     * MI-GAN is unavailable or fails. Safe to call on any thread. Null on failure.
      */
     fun opencvInpaint(rgb: ByteArray, mask: ByteArray, width: Int, height: Int): ByteArray? {
         return nativeOpencvInpaint(rgb, mask, width, height)
@@ -158,24 +153,14 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         nativeEncodeJpeg(rgb, width, height, quality)
 
     /**
-     * In-place tint harmonization for the LaMa-filled region. Shifts the
-     * mean RGB of the masked pixels toward the 1-px ring of real pixels
-     * just outside, clamped to ±25 per channel. Modifies [rgb] in place.
-     */
-    fun harmonizeLamaRegion(
-        rgb: ByteArray,
-        mask: ByteArray,
-        width: Int,
-        height: Int
-    ): Unit = nativeHarmonizeLamaRegion(rgb, mask, width, height)
-
-    /**
      * In-place grain match for the inpainted region. Injects sensor noise
      * matching the band just outside the hole into the filled pixels so the
-     * smooth LaMa/Telea patch sits in the same grain as the surround.
+     * smooth inpaint/Telea patch sits in the same grain as the surround.
      * Self-skips when the surround is too thin/clean to measure (no-op on
      * synthetic inputs). Call AFTER [finalize] so the Poisson clone doesn't
      * smooth the injected noise out. Modifies [rgb] in place.
+     *
+     * (Native fn keeps the legacy "Lama" name — it's engine-agnostic grain.)
      */
     fun textureLamaRegion(
         rgb: ByteArray,
@@ -200,8 +185,8 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
 
         /**
          * Pack an RGB byte array into an existing ARGB_8888 Bitmap (alpha
-         * set to 0xFF). Returns true on success. Fast path replaces the
-         * Bitmap.setPixels(IntArray) per-pixel pack used by LamaInpainter.
+         * set to 0xFF). Returns true on success. Fast path replaces a
+         * Bitmap.setPixels(IntArray) per-pixel pack.
          */
         fun fillBitmapFromRgb(
             rgb: ByteArray, w: Int, h: Int, bmp: android.graphics.Bitmap
@@ -253,9 +238,6 @@ class NativeSession(capacity: Int = 80) : AutoCloseable {
         @JvmStatic private external fun nativeEncodeJpeg(
             rgb: ByteArray, width: Int, height: Int, quality: Int
         ): ByteArray?
-        @JvmStatic private external fun nativeHarmonizeLamaRegion(
-            rgb: ByteArray, mask: ByteArray, width: Int, height: Int
-        )
         @JvmStatic private external fun nativeTextureLamaRegion(
             rgb: ByteArray, mask: ByteArray, width: Int, height: Int
         )

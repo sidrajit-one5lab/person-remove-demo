@@ -1,7 +1,7 @@
 package com.one5.personremoval.core
 
 import android.util.Log
-import com.one5.personremoval.ml.LamaInpainter
+import com.one5.personremoval.ml.MiGanInpainter
 
 data class PipelineResult(
     val rgb: ByteArray,
@@ -31,7 +31,7 @@ data class PipelineResult(
 
 class CaptureUseCase(
     private val nativeSession: NativeSession,
-    @Volatile var lamaInpainter: LamaInpainter? = null,
+    @Volatile var miganInpainter: MiGanInpainter? = null,
 ) {
 
     fun execute(
@@ -85,28 +85,16 @@ class CaptureUseCase(
         Log.i(TAG, "ghost check holeEdge=%.3f surroundEdge=%.3f isGhost=%b fill=%.2f"
             .format(ghost.holeEdgeDensity, ghost.surroundEdgeDensity, ghost.isGhost, actualFill))
 
-        // Route on how much of the hole we recovered from *real* background
-        // samples (actualFill), in three bands:
-        //
-        //   actualFill < LOW_FILL_THRESHOLD
-        //       The subject occluded almost the whole hole for the entire
-        //       buffer window — there is essentially no real background to
-        //       extend from. Handing this to LaMa means tiling a huge
-        //       person-shaped void: multi-second inference that only
-        //       hallucinates a ghost. Fast-fill with classical Telea and tell
-        //       the user to move the subject / retake. Honest fast failure
-        //       beats slow garbage.
-        //
-        //   LOW_FILL_THRESHOLD <= actualFill < HIGH_FILL_THRESHOLD
-        //       Enough real background surrounds the gap that LaMa can extend
-        //       surfaces and lines inward. This is the AI-inpaint band.
-        //
-        //   actualFill >= HIGH_FILL_THRESHOLD
-        //       Only stray pixels remain; classical Telea is fast and good
-        //       enough — no need to pay for LaMa.
+        // Fill engine and user-messaging are decoupled:
+        //  - ENGINE: MI-GAN fills every hole in one fast forward pass
+        //    (purpose-built remover); classical OpenCV (Telea/NS) is the
+        //    fallback only if MI-GAN is unavailable or throws.
+        //  - MESSAGING: the fill ratio still shapes the retake hint.
+        //    actualFill < LOW_FILL_THRESHOLD = the subject occluded almost the
+        //    whole hole (little real background); combined with surround
+        //    complexity it decides "fill quietly" vs "ask for a retake".
         val needsInpaint = actualUnfilled > 0
         val lowFill = actualFill < LOW_FILL_THRESHOLD
-        val useLama = needsInpaint && !lowFill && actualFill < HIGH_FILL_THRESHOLD
 
         // On a low-fill capture the hole is mostly invention regardless of
         // engine, so the question stops being "which inpainter" and becomes
@@ -122,45 +110,53 @@ class CaptureUseCase(
         } else null
         val extendableLowFill = lowFillComplexity?.isLowInformation == true
 
+        // Dilate the fill mask by a small margin before inpainting so the
+        // inpainter repaints a thin band at the hole boundary instead of
+        // trusting the exact stitch seam, where sub-pixel softening can linger.
+        // Kept small (INPAINT_MASK_DILATE_PX) so we don't discard good real bg —
+        // the keepIds exclusion already removed the main edge-contamination
+        // source, so this is a light seam guard, not a heavy repaint. The SAME
+        // dilated mask drives inpaint + finalize + grain so all three cover one
+        // region; the undilated unfilledMask still drives the fill-ratio, ghost
+        // and complexity measurements above.
+        val inpaintMask = if (needsInpaint) {
+            NativeSession.nativeDilateMask(
+                stitch.unfilledMask, stitch.width, stitch.height, INPAINT_MASK_DILATE_PX)
+        } else {
+            stitch.unfilledMask
+        }
+
         val filledRgb: ByteArray
         val inpaintMethod: String
-        when {
-            !needsInpaint -> {
-                filledRgb = stitch.rgb
-                inpaintMethod = "none"
+        if (!needsInpaint) {
+            filledRgb = stitch.rgb
+            inpaintMethod = "none"
+        } else {
+            // MI-GAN fills every hole: its pipeline takes the FULL frame +
+            // (dilated) hole mask and crops/resizes/inpaints/pastes/blends in
+            // one fast forward pass. Falls back to classical OpenCV (Telea/NS)
+            // only if MI-GAN is unavailable or throws.
+            var ok: ByteArray? = null
+            var method = "opencv"
+            miganInpainter?.let { mig ->
+                try {
+                    ok = mig.inpaint(stitch.rgb, inpaintMask, stitch.width, stitch.height)
+                    method = "migan"
+                } catch (t: Throwable) {
+                    Log.w(TAG, "MI-GAN threw, falling back to OpenCV", t)
+                }
             }
-            !useLama -> {
-                // Both the low-fill and the near-complete bands land here:
-                // classical Telea, fast, no LaMa.
-                val cv = nativeSession.opencvInpaint(
-                    stitch.rgb, stitch.unfilledMask, stitch.width, stitch.height)
-                filledRgb = cv ?: stitch.rgb
-                inpaintMethod = when {
-                    cv == null -> "none-failed"
+            if (ok == null) {
+                ok = nativeSession.opencvInpaint(stitch.rgb, inpaintMask,
+                                                 stitch.width, stitch.height)
+                method = when {
+                    ok == null -> "none-failed"
                     lowFill -> "opencv-ns-lowfill"
                     else -> "opencv-ns-fast"
                 }
             }
-            else -> {
-                var ok: ByteArray? = null
-                var method = "lama"
-                lamaInpainter?.let { lama ->
-                    try {
-                        ok = lama.inpaintGaps(stitch.rgb, stitch.unfilledMask,
-                                              stitch.width, stitch.height)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "LaMa inpaint threw, falling back", t)
-                        method = "opencv"
-                    }
-                } ?: run { method = "opencv" }
-                if (ok == null) {
-                    ok = nativeSession.opencvInpaint(stitch.rgb, stitch.unfilledMask,
-                                                     stitch.width, stitch.height)
-                    method = "opencv"
-                }
-                filledRgb = ok ?: stitch.rgb
-                inpaintMethod = if (ok == null) "none-failed" else method
-            }
+            filledRgb = ok ?: stitch.rgb
+            inpaintMethod = method
         }
 
         // Color reconciliation between the fill and the surrounding photo is
@@ -172,19 +168,19 @@ class CaptureUseCase(
         // color pass, not two stacked passes that partially undo each other.
 
         val polished = nativeSession.finalize(
-            stitch.rgb, filledRgb, stitch.unfilledMask,
+            stitch.rgb, filledRgb, inpaintMask,
             stitch.width, stitch.height
         ) ?: filledRgb
 
-        // Grain match the inpainted region as the final step. The LaMa/Telea
+        // Grain match the inpainted region as the final step. Any AI/classical
         // fill is low-frequency and reads as a too-smooth patch against the
         // grainy surround; injecting matched sensor noise lets it blend.
         // Done AFTER finalize so the Poisson clone doesn't smooth it back out,
-        // and only on the inpaint path. Self-skips on clean/thin surrounds, so
-        // it never degrades a good capture.
-        if (useLama) {
+        // and only when something was actually filled. Self-skips on clean/thin
+        // surrounds, so it never degrades a good capture.
+        if (needsInpaint) {
             nativeSession.textureLamaRegion(
-                polished, stitch.unfilledMask, stitch.width, stitch.height)
+                polished, inpaintMask, stitch.width, stitch.height)
         }
 
         val totalMs = System.currentTimeMillis() - t0
@@ -268,11 +264,15 @@ class CaptureUseCase(
     private companion object {
         const val TAG = "PRPipeline"
 
-        // Real-pixel fill-ratio routing thresholds (see execute() for the
-        // three-band rationale). Tunable: raise LOW_FILL_THRESHOLD to gate
-        // more aggressively toward retake, lower it to let LaMa attempt
-        // sparser holes.
+        // Below this real-pixel fill ratio the hole is mostly invention; the
+        // surround-complexity check then decides "fill quietly" vs "retake".
+        // Tunable: raise to gate more aggressively toward retake.
         const val LOW_FILL_THRESHOLD = 0.35f
-        const val HIGH_FILL_THRESHOLD = 0.90f
+
+        // Margin (px) the inpaint fill mask is dilated by before the inpainter,
+        // so it repaints a thin band at the stitch seam rather than
+        // conditioning on it. Small on purpose — larger discards good real
+        // background. Raise only if a seam halo persists.
+        const val INPAINT_MASK_DILATE_PX = 6
     }
 }

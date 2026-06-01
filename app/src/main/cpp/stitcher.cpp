@@ -214,97 +214,6 @@ StitchResult stitch(
 // Stage 5 / Stage 6 post-stitch passes.
 // ----------------------------------------------------------------------------
 
-void matchStitchToReferenceTint(
-        cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        int bandPx) {
-    if (stitched.empty() || reference.empty() || holeMask.empty()) return;
-    if (stitched.size() != reference.size() ||
-        stitched.size() != holeMask.size()) return;
-
-    // Build an outer ring (just outside the hole) and an inner ring (just inside).
-    cv::Mat kern = cv::getStructuringElement(
-            cv::MORPH_RECT,
-            cv::Size(2 * bandPx + 1, 2 * bandPx + 1));
-    cv::Mat dilated, eroded, outerRing, innerRing;
-    cv::dilate(holeMask, dilated, kern);
-    cv::erode(holeMask, eroded, kern);
-    cv::subtract(dilated, holeMask, outerRing);
-    cv::subtract(holeMask, eroded, innerRing);
-
-    const int outerCount = cv::countNonZero(outerRing);
-    const int innerCount = cv::countNonZero(innerRing);
-    if (outerCount < 200 || innerCount < 200) {
-        // Tiny hole or hole hugging the image edge — bail rather than shift
-        // the patch by a poorly-estimated diff.
-        LOGI("matchTint: rings too thin (outer=%d inner=%d), skipping",
-             outerCount, innerCount);
-        return;
-    }
-
-    // Mean-only color match. Earlier iterations tried adding per-channel
-    // variance scaling (histogram matching), but that requires sampling a
-    // representative "natural" patch interior — which doesn't exist for
-    // large holes that span multiple scene regions. In testing, the variance
-    // sampling consistently picked the wrong reference (either the boundary
-    // band with inflated edge variance, or the deep interior spanning
-    // diverse content) and made things visibly worse by squashing variance
-    // toward the clamp limits. The mean shift alone is well-behaved and
-    // robust across scenes; visible patch artifacts that mean-only can't fix
-    // (mostly large-hole selfies) need a different architectural fix (path C,
-    // high-resolution capture), not more statistical post-processing.
-    const cv::Scalar refMean = cv::mean(reference, outerRing);
-    const cv::Scalar stitchMean = cv::mean(stitched, innerRing);
-    const cv::Scalar diff = refMean - stitchMean;
-
-    LOGI("matchTint: refRing=(%.0f,%.0f,%.0f) stitchRing=(%.0f,%.0f,%.0f) "
-         "diff=(%.1f,%.1f,%.1f)",
-         refMean[0], refMean[1], refMean[2],
-         stitchMean[0], stitchMean[1], stitchMean[2],
-         diff[0], diff[1], diff[2]);
-
-    cv::Mat shifted32;
-    stitched.convertTo(shifted32, CV_32FC3);
-    cv::add(shifted32,
-            cv::Scalar(diff[0], diff[1], diff[2], 0),
-            shifted32);
-    cv::Mat shifted8;
-    shifted32.convertTo(shifted8, CV_8UC3);
-    shifted8.copyTo(stitched, holeMask);
-}
-
-void featherStitchBoundary(
-        cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        int bandPx) {
-    if (stitched.empty() || reference.empty() || holeMask.empty()) return;
-    if (stitched.size() != reference.size() ||
-        stitched.size() != holeMask.size()) return;
-
-    const int k = 2 * bandPx + 1;  // odd kernel for GaussianBlur
-
-    // Soft alpha from the binary hole mask: ~1.0 deep inside hole, 0.0 far
-    // outside, smooth gradient in the bandPx-wide ring at the boundary.
-    cv::Mat alpha8;
-    cv::GaussianBlur(holeMask, alpha8, cv::Size(k, k), 0);
-    cv::Mat alphaF;
-    alpha8.convertTo(alphaF, CV_32F, 1.0 / 255.0);
-
-    cv::Mat stitched32, ref32;
-    stitched.convertTo(stitched32, CV_32FC3);
-    reference.convertTo(ref32, CV_32FC3);
-
-    std::vector<cv::Mat> ach{alphaF, alphaF, alphaF};
-    cv::Mat alpha3;
-    cv::merge(ach, alpha3);
-
-    cv::Mat blended = stitched32.mul(alpha3) +
-                      ref32.mul(cv::Scalar::all(1) - alpha3);
-    blended.convertTo(stitched, CV_8UC3);
-}
-
 void unsharpMaskInHole(
         cv::Mat& image,
         const cv::Mat& holeMask,
@@ -451,96 +360,6 @@ void matchNoiseToReferenceSurround(
 }
 
 // ----------------------------------------------------------------------------
-// Post-stitch ghost detector.
-// ----------------------------------------------------------------------------
-
-void detectGhostPixels(
-        const cv::Mat& stitched,
-        const cv::Mat& reference,
-        const cv::Mat& holeMask,
-        const cv::Mat& personMask,
-        cv::Mat& unfilled,
-        const cv::Mat& sampleCount) {
-    if (stitched.empty() || holeMask.empty() || unfilled.empty()) return;
-
-    cv::Mat kern = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(33, 33));
-    cv::Mat dilated, outerRing;
-    cv::dilate(holeMask, dilated, kern);
-    cv::subtract(dilated, holeMask, outerRing);
-    if (cv::countNonZero(outerRing) < 200) return;
-
-    cv::Mat stitchGray;
-    cv::cvtColor(stitched, stitchGray, cv::COLOR_RGB2GRAY);
-    cv::Scalar bandMean, bandStddev;
-    cv::meanStdDev(stitchGray, bandMean, bandStddev, outerRing);
-
-    const auto outerMean = static_cast<float>(bandMean[0]);
-    const auto outerStd  = static_cast<float>(bandStddev[0]);
-    const float outerLimit = std::max(50.0f, outerStd * 3.0f);
-
-    const bool haveSampleCount = !sampleCount.empty() &&
-            sampleCount.size() == stitchGray.size() &&
-            sampleCount.type() == CV_8UC1;
-
-    // Reference-similarity ghost detection: if a stitched pixel where the
-    // person ACTUALLY IS (undilated personMask) looks very similar to the
-    // reference frame, the temporal median reproduced the person instead of
-    // finding background. Only checked inside personMask — the dilation
-    // margin is background in both stitch and reference, so similarity
-    // there is expected and correct.
-    cv::Mat refGray;
-    const bool haveRef = !reference.empty() &&
-            reference.size() == stitched.size();
-    if (haveRef) {
-        cv::cvtColor(reference, refGray, cv::COLOR_RGB2GRAY);
-    }
-    const bool havePersonMask = !personMask.empty() &&
-            personMask.size() == stitchGray.size() &&
-            personMask.type() == CV_8UC1;
-    constexpr float kRefSimilarityLimit = 25.0f;
-
-    int flaggedOuter = 0, flaggedRef = 0;
-    const int H = stitchGray.rows, W = stitchGray.cols;
-    for (int y = 0; y < H; ++y) {
-        const uchar* sGray  = stitchGray.ptr<uchar>(y);
-        const auto*  hRow   = holeMask.ptr<uchar>(y);
-        auto*        uRow   = unfilled.ptr<uchar>(y);
-        const uchar* scRow  = haveSampleCount ? sampleCount.ptr<uchar>(y) : nullptr;
-        const uchar* rGray  = haveRef ? refGray.ptr<uchar>(y) : nullptr;
-        const uchar* pRow   = havePersonMask ? personMask.ptr<uchar>(y) : nullptr;
-        for (int x = 0; x < W; ++x) {
-            if (hRow[x] == 0) continue;
-            if (uRow[x] != 0) continue;
-
-            // Low-sample pixels: check against outer-ring mean (original logic)
-            if (!scRow || scRow[x] < 3) {
-                float diff = std::abs(static_cast<float>(sGray[x]) - outerMean);
-                if (diff > outerLimit) {
-                    uRow[x] = 255;
-                    ++flaggedOuter;
-                }
-                continue;
-            }
-
-            // High-sample pixels inside the person body: if stitch ≈ reference,
-            // the median picked up the person, not background.
-            if (rGray && pRow && pRow[x] != 0) {
-                float refDiff = std::abs(static_cast<float>(sGray[x]) -
-                                         static_cast<float>(rGray[x]));
-                if (refDiff < kRefSimilarityLimit) {
-                    uRow[x] = 255;
-                    ++flaggedRef;
-                }
-            }
-        }
-    }
-    LOGI("ghostDetect: flaggedOuter=%d flaggedRef=%d (outerMean=%.0f "
-         "outerStd=%.1f limit=%.1f refCompare=%s personMask=%s)",
-         flaggedOuter, flaggedRef, outerMean, outerStd, outerLimit,
-         haveRef ? "yes" : "no", havePersonMask ? "yes" : "no");
-}
-
-// ----------------------------------------------------------------------------
 // Multi-band (Laplacian pyramid) blend.
 // ----------------------------------------------------------------------------
 
@@ -569,7 +388,6 @@ void multiBandBlendStitch(
     // Bail when the hole touches the image border on both inner and outer
     // mask boundaries — MultiBandBlender has been observed to produce
     // smeared border pixels in that degenerate case. The legacy
-    // matchStitchToReferenceTint + featherStitchBoundary path is the
     // fallback (caller decides).
     cv::Mat refMask;
     cv::bitwise_not(holeMask, refMask);
